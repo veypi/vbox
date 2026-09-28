@@ -207,3 +207,28 @@ func TestClassStringRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// tmpToOS 固定向量（纯函数，跨平台可测）：/tmp 虚拟别名 → windows 临时目录
+// 原生路径；非 /tmp 前缀一律 ok=false（与 proto.WinTmpToOS 同源同向量）。
+func TestTmpToOS(t *testing.T) {
+	t.Parallel()
+	tmp := `C:\Users\x\AppData\Local\Temp`
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"/tmp", tmp, true},
+		{"/tmp/", tmp, true},
+		{"/tmp/a", tmp + `\a`, true},
+		{"/tmp/a b/c.txt", tmp + `\a b\c.txt`, true},
+		{"/tmpfoo", "", false},
+		{"/c/tmp", "", false},
+		{"/", "", false},
+	}
+	for _, c := range cases {
+		got, ok := tmpToOS(c.in, tmp)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("tmpToOS(%q) = %q, %v; want %q, %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}

@@ -14,7 +14,7 @@ import (
 // 注意：vbox 的 Rule 是纯数据；「裸路径覆盖子树」由 matcher 承担（不再需要
 // /** 子树展开行）；字面前缀的 canonical 在编译期完成（macOS /var symlink 类）。
 
-// fsEffectPrefixes 行首白名单前缀（保护 C:/ 盘符——"C:" 不在白名单，
+// fsEffectPrefixes 行首白名单前缀（保护盘符形——"C:" 不在白名单，
 // 整行按缺前缀报错）。
 var fsEffectPrefixes = []struct {
 	prefix string
@@ -79,8 +79,9 @@ func isLiteralGlobal(p string) bool {
 	return p == "/" || p == "**" || p == "/**"
 }
 
-// driveRootRe 匹配整盘根三形态：C: / C:/ / C:/**（大小写不限；配置跨平台共享，统一禁写）。
-var driveRootRe = regexp.MustCompile(`(?i)^[a-z]:(/\*\*)?/?$`)
+// driveRootRe 匹配整盘根：旧输入形 C: / C:/ / C:/** 与 /c/ 规范形
+// /c / /c/ / /c/**（大小写不限；配置跨平台共享，统一禁写）。
+var driveRootRe = regexp.MustCompile(`(?i)^([a-z]:|/[a-z])(/\*\*)?/?$`)
 
 // ValidateFSGrantTarget 校验 grant fs 目标（具体绝对路径，非模式）——
 // 与规则行同护栏：全域/家根/盘根不可授。

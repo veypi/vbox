@@ -2,6 +2,7 @@ package vbox
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -12,56 +13,125 @@ import (
 // 与规则模式都经 canonical——进程内门（FSRuleSet.Match）两侧同口径；
 // dualForms 供 OS 沙箱名单派生用（seatbelt 按系统调用原始路径串匹配，
 // 无 canonical 化，故名单须同时含字面形与解析形）。
+//
+// 2026-09-24：windows 规范形全局统一为 /c/ 类 Linux 形（废除 C:/ 盘符形）——
+// canonical 出口一律 /c/…；入口接受任意盘符形态容错归一。以下三个helper
+// 与 aic-pod/libs/proto 同源（vbox 自持不引 aic-pod，避免模块环）。
 
-// bareDriveRe 匹配裸盘符形态（"C:"）。
-var bareDriveRe = regexp.MustCompile(`^[A-Za-z]:$`)
+// normalizeHostPath 把 windows 盘符输入归一为 /c/… 规范形（纯语法、与 GOOS
+// 无关——匹配层与执行层结果必须一致，归一不按 GOOS 分叉）；非盘符形态
+// 原样返回。
+func normalizeHostPath(p string) string {
+	if driveInputRe.MatchString(p) {
+		rest := strings.ReplaceAll(p[2:], `\`, "/")
+		return path.Clean("/" + strings.ToLower(p[:1]) + "/" + rest)
+	}
+	if strings.HasPrefix(p, "/") {
+		p = path.Clean(p)
+		if len(p) > 1 && driveInputRe.MatchString(p[1:]) {
+			rest := strings.ReplaceAll(p[3:], `\`, "/")
+			return path.Clean("/" + strings.ToLower(p[1:2]) + "/" + rest)
+		}
+	}
+	return p
+}
 
-// isBareDrive 报告 p 是否为 windows 裸盘符（非 windows 恒 false——posix 上
-// "C:" 是普通相对路径名，不做特殊处理）。
-func isBareDrive(p string) bool {
-	return runtime.GOOS == "windows" && bareDriveRe.MatchString(p)
+// driveInputRe 匹配盘符输入形态：C:（裸盘符）、C:/…、C:\…（C:foo 不匹配）。
+var driveInputRe = regexp.MustCompile(`^[A-Za-z]:([\\/]|$)`)
+
+// splitDriveRoot 拆规范形首段盘符（/c → 'c'；/c/x → 'c',"x"）。
+func splitDriveRoot(p string) (drive byte, rest string, ok bool) {
+	if len(p) >= 2 && p[0] == '/' && isLetterByte(p[1]) {
+		if len(p) == 2 {
+			return p[1], "", true
+		}
+		if p[2] == '/' {
+			return p[1], p[3:], true
+		}
+	}
+	return 0, "", false
+}
+
+func isLetterByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// hostPathToOS 把 /c/ 规范形（及旧输入形）转回 OS 原生路径（windows；posix
+// 恒等——"C:" 是合法相对文件名，不做盘符归一）。windows 上 /tmp 是虚拟别名：
+// cygwin 式映射 os.TempDir()（与 aic-pod/libs/proto.HostPathToOS 同口径——
+// /tmp 查询 canonical 后落进临时目录便利根，无需字面 /tmp 规则行）。
+func hostPathToOS(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	p = normalizeHostPath(p)
+	if q, ok := tmpToOS(p, os.TempDir()); ok {
+		return q
+	}
+	if d, rest, ok := splitDriveRoot(p); ok {
+		return strings.ToUpper(string(d)) + `:\` + strings.ReplaceAll(rest, "/", `\`)
+	}
+	return p
+}
+
+// tmpToOS 把 /tmp（及子路径）映射为 windows 临时目录原生路径（与
+// aic-pod/libs/proto.WinTmpToOS 同源——vbox 自持不引 aic-pod，避免模块环）。
+// 纯函数（tmpDir 注入，跨平台可测）。
+func tmpToOS(p, tmpDir string) (string, bool) {
+	if p != "/tmp" && !strings.HasPrefix(p, "/tmp/") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(p[len("/tmp"):], "/")
+	tmpDir = strings.TrimSuffix(tmpDir, `\`)
+	if rest == "" {
+		return tmpDir, true
+	}
+	return tmpDir + `\` + strings.ReplaceAll(rest, "/", `\`), true
+}
+
+// hostPathFromOS canonical 系列出口归一：windows 原生态 → /c/ 规范形；
+// posix 仅斜杠归一。
+func hostPathFromOS(p string) string {
+	if runtime.GOOS != "windows" {
+		return filepath.ToSlash(p)
+	}
+	return normalizeHostPath(filepath.ToSlash(p))
 }
 
 // Canonical 展开符号链接到真实文件系统身份：EvalSymlinks 逐级向父目录回退
 // （目标不存在时展开最近存在祖先，剩余路径原样拼接——写新文件场景）。
-// 反斜杠归一为 /（匹配器统一斜杠语义）。
+// 输出为 /c/ 规范形（posix 为 posix 形）。
 // 递归到文件系统根基（/ 或 C:\）时直接返回原路径：根基无可展开项，且
 // TrimSuffix 根基分隔符得空串/盘符，继续递归会退化成相对路径。
-// windows 裸盘符（"C:"）先补为盘根（"C:\"）再展开：EvalSymlinks 对裸盘符
-// 是盘符当前目录语义，权限判定必须按盘根口径。
 func Canonical(p string) string {
-	if isBareDrive(p) {
-		p += `\`
-	}
+	p = hostPathToOS(p)
 	p = filepath.Clean(p)
 	if r, err := filepath.EvalSymlinks(p); err == nil {
-		return filepath.ToSlash(r)
+		return hostPathFromOS(r)
 	}
 	dir, base := filepath.Split(p)
 	if dir == "" {
-		return filepath.ToSlash(p)
+		return hostPathFromOS(p)
 	}
 	parent := strings.TrimSuffix(dir, string(filepath.Separator))
 	if parent == filepath.VolumeName(dir) {
-		return filepath.ToSlash(p)
+		return hostPathFromOS(p)
 	}
 	return Canonical(parent) + "/" + base
 }
 
 // CanonicalNoFollow 展开父目录符号链接、保留末段字面形（unlink/rename 语义：
 // 系统调用作用于链接本身，判定必须同口径）。父链复用 Canonical（含最近存在
-// 祖先回退）；末段为根/退化形态时退回跟随版。
+// 祖先回退）；末段为根/退化形态时退回跟随版。输出同为 /c/ 规范形。
 func CanonicalNoFollow(p string) string {
-	if isBareDrive(p) {
-		p += `\`
-	}
+	p = hostPathToOS(p)
 	p = filepath.Clean(p)
 	parent := filepath.Dir(p)
 	base := filepath.Base(p)
 	if base == "." || base == string(filepath.Separator) || parent == p {
 		return Canonical(p)
 	}
-	return filepath.ToSlash(filepath.Join(Canonical(parent), base))
+	return hostPathFromOS(filepath.Join(Canonical(parent), base))
 }
 
 // DualForms 返回路径的 canonical 形与原始字面形（去尾斜杠；相同则只给一个）。
@@ -78,12 +148,13 @@ func DualForms(p string) []string {
 	}
 	c := Canonical(p)
 	if c == "" {
-		c = filepath.Clean(p)
+		c = hostPathFromOS(filepath.Clean(p))
 	}
-	if c == p {
+	lit := hostPathFromOS(p)
+	if c == lit {
 		return []string{c}
 	}
-	return []string{c, p}
+	return []string{c, lit}
 }
 
 // DualList 对一组路径逐个展开 DualForms（去重交给 DedupClean）。
