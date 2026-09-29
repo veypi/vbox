@@ -25,9 +25,9 @@ fs 与 net 两域各有规则集（`FSRuleSet` / `NetRuleSet`）；审批策略�
 
 OS 落地（自 aic-pod exec_procs 迁入，2026-09-29）：darwin seatbelt 按
 first-wins 快照**逆序**输出（SBPL 后规则胜 → 首命中等价，ro/rw 洞内核
-真实生效）；linux bwrap / windows 受限令牌+ACE 当前消费 deny/writeAllow
-字段（fail-closed 全量隔离，行序映射待做）。调用方状态（公共区/缓存根）
-经 hooks.go 注入。
+真实生效）；linux bwrap 先求值后落措施（可实例化目标的 ro/rw 洞按序
+回补，W3）；windows 受限令牌+ACE 求值后 rw 洞跳过 ACE（ro/嵌套洞仅
+工具层生效）。调用方状态（公共区/缓存根）经 hooks.go 注入。
 
 ## 与 aic-pod 的关系
 

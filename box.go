@@ -18,9 +18,10 @@ type Policy struct {
 
 // Caps 平台沙箱表达能力。
 type Caps struct {
-	// OrderedFSRules：内核可表达完整行序（ro/rw 洞真实生效——darwin seatbelt
-	// M3 行序映射）；false = 仅能 fail-closed 落全量 deny（linux/windows 现状，
-	// ro/rw 洞仅进程内门放行）。
+	// OrderedFSRules：内核可表达行序洞（ro/rw 洞真实生效）——darwin seatbelt
+	// 逆序映射全表；linux bwrap 先求值后落措施（W3：可实例化目标的 ro/rw 洞
+	// 回补，不可实例化条目 fail-closed）；windows 仅 rw 洞可落（跳过 ACE），
+	// ro/嵌套洞仅进程内门放行。
 	OrderedFSRules bool
 	// NetPerProcess：可在子进程粒度表达网络规则（darwin 仅 loopback 精确，
 	// 不可表达条目启动前拒绝——沿用 pod 现状语义）。
@@ -30,9 +31,9 @@ type Caps struct {
 // Capabilities 返回当前平台的沙箱表达能力。
 func Capabilities() Caps {
 	switch runtime.GOOS {
-	case "darwin":
+	case "darwin", "linux":
 		return Caps{OrderedFSRules: true, NetPerProcess: true}
-	case "linux", "windows":
+	case "windows":
 		return Caps{OrderedFSRules: false, NetPerProcess: true}
 	default:
 		return Caps{}

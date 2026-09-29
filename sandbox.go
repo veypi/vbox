@@ -180,7 +180,7 @@ func confineRlimits(argv []string) []string {
 	return append([]string{"/bin/sh", "-c", script, "sh"}, argv...)
 }
 
-func bwrapArgs(spec confineSpec, cacheDirs []string, protectedReadonly []string, denyTargets []string) []string {
+func bwrapArgs(spec confineSpec, cacheDirs []string, protectedReadonly []string, deny denyMountPlan) []string {
 	// 读默认开放：整机 ro-bind 读视图；fs_policy=open（写级）整机 rw bind。
 	// deny 覆盖挂载在末尾追加，恒优先。
 	args := []string{"bwrap"}
@@ -211,20 +211,128 @@ func bwrapArgs(spec confineSpec, cacheDirs []string, protectedReadonly []string,
 	}
 	// deny 隔离覆盖（§5.10）：后挂载优先（bwrap 后绑定覆盖前绑定），
 	// 追加在全部 bind 之后；read-only 与 workspace-write 同隔离。
-	args = append(args, bwrapDenyArgs(denyTargets)...)
+	args = append(args, deny.args()...)
 	return append(append(args, "--"), spec.argv...)
 }
 
-// bwrapDenyArgs overlays pre-instantiated deny targets after allow mounts.
-func bwrapDenyArgs(targets []string) []string {
+// denyMountPlan 实例化 deny 目标经 first-wins 求值后的内核处置计划（W3）。
+type denyMountPlan struct {
+	cover []string // 终局 deny：覆盖挂载（目录 tmpfs / 文件·socket 以 /dev/null ro-bind）
+	ro    []string // 终局 ro：--ro-bind 回补（可读不可写）
+	rw    []string // 终局 rw：--bind 回补（覆盖失效，与快照终局一致）
+}
+
+// args 按序输出挂载参数：cover 覆盖先行，ro/rw 洞回补在后（后绑定覆盖先绑定）。
+func (p denyMountPlan) args() []string {
 	var args []string
-	for _, p := range targets {
-		if p == "" {
-			continue
-		}
-		args = append(args, overlayArgs(p)...)
+	for _, t := range p.cover {
+		args = append(args, overlayArgs(t)...)
+	}
+	for _, t := range p.ro {
+		args = append(args, bindIfExists(t, true)...)
+	}
+	for _, t := range p.rw {
+		args = append(args, bindIfExists(t, false)...)
 	}
 	return args
+}
+
+// evaluateDenyTargets 按 vbox 快照（first-wins）求值每个实例化 deny 目标的
+// 终局效果（W3，permission_rules §5「先求值后落措施」）：终局 deny → 覆盖；
+// 终局 ro（写拒读放）→ ro-bind 回补；终局 rw → rw-bind 回补。rules 为空 =
+// 全部覆盖（旧行为，fail-closed）。随后补嵌套洞（ro/rw 行字面前缀落在终局
+// deny 目标子树内的按序回补）。
+func evaluateDenyTargets(targets []string, rules *FSRuleSet) denyMountPlan {
+	var plan denyMountPlan
+	for _, t := range targets {
+		if rules == nil {
+			plan.cover = append(plan.cover, t)
+			continue
+		}
+		if rules.Match(t, OpWrite).Allow {
+			plan.rw = append(plan.rw, t)
+			continue
+		}
+		if rules.Match(t, OpRead).Allow {
+			plan.ro = append(plan.ro, t)
+		} else {
+			plan.cover = append(plan.cover, t)
+		}
+	}
+	if rules != nil {
+		// 嵌套洞比较两侧同口径 canonical（生产快照行已 canonical；目标来自
+		// 实例化名单可能含字面形——macOS firmlink 下两侧错位会漏回补）。
+		canonCover := make([]string, len(plan.cover))
+		for i, c := range plan.cover {
+			canonCover[i] = Canonical(c)
+		}
+		ro, rw := nestedDenyHoles(rules.Rules, canonCover)
+		plan.ro = append(plan.ro, ro...)
+		plan.rw = append(plan.rw, rw...)
+	}
+	return plan
+}
+
+// nestedDenyHoles 求嵌套洞：ro/rw 行的字面前缀落在终局 deny 目标子树内——
+// 目标整树被覆盖后按序回补（bwrap 后绑定覆盖先绑定；洞源不存在由
+// bindIfExists 跳过，声明仅工具层生效）。
+func nestedDenyHoles(rows []Rule, cover []string) (ro, rw []string) {
+	for _, r := range rows {
+		if r.Effect == EffDeny {
+			continue
+		}
+		lit := literalPrefix(r.Pattern)
+		if lit == "" || !underAnyPath(lit, cover) {
+			continue
+		}
+		if r.Effect == EffRO {
+			ro = append(ro, lit)
+		} else {
+			rw = append(rw, lit)
+		}
+	}
+	return
+}
+
+// literalPrefix 取 glob 模式的字面前缀（首个通配段之前；无通配 = 整串；
+// 首段即通配返回空）。
+func literalPrefix(pat string) string {
+	segs := strings.Split(filepath.ToSlash(pat), "/")
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		if strings.ContainsAny(s, "*?") {
+			break
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "/")
+}
+
+// underAnyPath 报告 p 是否等于或落在 roots 任一根之下。
+func underAnyPath(p string, roots []string) bool {
+	for _, r := range roots {
+		if p == r || strings.HasPrefix(p, r+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// bindIfExists 洞回补挂载（源不存在跳过并声明仅工具层生效——不静默创目录）。
+func bindIfExists(p string, ro bool) []string {
+	if p == "" {
+		return nil
+	}
+	if _, err := os.Stat(p); err != nil {
+		return nil
+	}
+	if ro {
+		return []string{"--ro-bind", p, p}
+	}
+	return []string{"--bind", p, p}
 }
 
 // overlayArgs 返回单目标路径的覆盖挂载参数（目录 tmpfs / 普通文件与 unix

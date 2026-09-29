@@ -49,5 +49,6 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if err != nil {
 		return launchPlan{}, err
 	}
-	return launchPlan{argv: bwrapArgs(spec, spec.extra, protected, denyTargets)}, nil
+	// W3：实例化目标按 vbox 快照（first-wins）求值后落措施——ro/rw 洞回补。
+	return launchPlan{argv: bwrapArgs(spec, spec.extra, protected, evaluateDenyTargets(denyTargets, spec.fsRules))}, nil
 }
