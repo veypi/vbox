@@ -8,10 +8,10 @@ import (
 	"time"
 )
 
-// 三段式接口（design §11.3）：规则模型（vbox.go/net.go）→ 编译（Compile，
+// 三段式接口：规则模型（vbox.go/net.go）→ 编译（Compile，
 // fail-closed——当前平台不可表达的规则启动前拒绝）→ 执行（Box）。
 //
-// 阶段二说明（design §11.5）：OS 落地（sandbox_*.go：seatbelt/bwrap/受限令牌）
+// 阶段二说明（迁移计划见 vsh/docs/todo.md 4.4）：OS 落地（sandbox_*.go：seatbelt/bwrap/受限令牌）
 // 在 M4 后从 aic-pod exec_procs 物理迁入；当前 Compile 做规则数据校验并返回
 // Spec，NewBox 返回 ErrOSLoweringPending——原生子进程执行暂由 pod exec_procs
 // 承担（native.go 直接调它），接口形状以此为准对齐。

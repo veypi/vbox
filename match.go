@@ -27,7 +27,7 @@ func MatchPattern(pattern, cpath string) bool {
 	pattern = strings.TrimSuffix(pattern, "/")
 	cpath = strings.TrimSuffix(cpath, "/")
 	if !strings.ContainsAny(pattern, "*?") {
-		// 裸路径覆盖子树（design §11.3）。
+		// 裸路径覆盖子树。
 		return cpath == pattern || strings.HasPrefix(cpath, pattern+"/")
 	}
 	psegs := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
