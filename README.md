@@ -21,11 +21,13 @@ fs 与 net 两域各有规则集（`FSRuleSet` / `NetRuleSet`）；审批策略�
 ## 三段式接口
 
 规则模型（vbox.go / net.go）→ 编译（`Compile`，fail-closed——当前平台
-不可表达的规则在启动前拒绝）→ 执行（`Box`）。
+不可表达的规则在启动前拒绝）→ 执行（`Manager`：RunProcess / Spawn）。
 
-当前阶段：OS 落地（seatbelt / bwrap / 受限令牌）仍由 aic-pod
-`libs/exec_procs` 承担，`NewBox` 返回 `ErrOSLoweringPending`；迁移计划见
-vsh `docs/todo.md` 4.4。
+OS 落地（自 aic-pod exec_procs 迁入，2026-09-29）：darwin seatbelt 按
+first-wins 快照**逆序**输出（SBPL 后规则胜 → 首命中等价，ro/rw 洞内核
+真实生效）；linux bwrap / windows 受限令牌+ACE 当前消费 deny/writeAllow
+字段（fail-closed 全量隔离，行序映射待做）。调用方状态（公共区/缓存根）
+经 hooks.go 注入。
 
 ## 与 aic-pod 的关系
 

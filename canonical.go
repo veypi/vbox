@@ -60,7 +60,8 @@ func isLetterByte(b byte) bool {
 // 恒等——"C:" 是合法相对文件名，不做盘符归一）。windows 上 /tmp 是虚拟别名：
 // cygwin 式映射 os.TempDir()（与 aic-pod/libs/proto.HostPathToOS 同口径——
 // /tmp 查询 canonical 后落进临时目录便利根，无需字面 /tmp 规则行）。
-func hostPathToOS(p string) string {
+// 导出供沙箱名单派生（OS 边界单一转换点）与嵌入方使用。
+func HostPathToOS(p string) string {
 	if runtime.GOOS != "windows" {
 		return p
 	}
@@ -104,7 +105,7 @@ func hostPathFromOS(p string) string {
 // 递归到文件系统根基（/ 或 C:\）时直接返回原路径：根基无可展开项，且
 // TrimSuffix 根基分隔符得空串/盘符，继续递归会退化成相对路径。
 func Canonical(p string) string {
-	p = hostPathToOS(p)
+	p = HostPathToOS(p)
 	p = filepath.Clean(p)
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return hostPathFromOS(r)
@@ -124,7 +125,7 @@ func Canonical(p string) string {
 // 系统调用作用于链接本身，判定必须同口径）。父链复用 Canonical（含最近存在
 // 祖先回退）；末段为根/退化形态时退回跟随版。输出同为 /c/ 规范形。
 func CanonicalNoFollow(p string) string {
-	p = hostPathToOS(p)
+	p = HostPathToOS(p)
 	p = filepath.Clean(p)
 	parent := filepath.Dir(p)
 	base := filepath.Base(p)

@@ -138,17 +138,13 @@ func cutEq(s string) (string, string, bool) {
 	return s, "", false
 }
 
-func TestCompileAndBoxSkeleton(t *testing.T) {
+func TestCompileSkeleton(t *testing.T) {
 	t.Parallel()
-	spec, err := Compile(Policy{
+	if _, err := Compile(Policy{
 		FS:  FSRuleSet{Rules: []Rule{{Pattern: "/a", Effect: EffRW}}, DefaultWrite: EffDeny},
 		Net: NetRuleSet{Rules: []NetRule{{HostPort: "example.com:443", Allow: true}}},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Compile err = %v", err)
-	}
-	if _, err := NewBox(spec); err != ErrOSLoweringPending {
-		t.Fatalf("NewBox err = %v, want ErrOSLoweringPending", err)
 	}
 	// 坏规则行编译期拒绝。
 	if _, err := Compile(Policy{Net: NetRuleSet{Rules: []NetRule{{HostPort: "bad host"}}}}); err == nil {
