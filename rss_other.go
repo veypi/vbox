@@ -8,5 +8,5 @@ package vbox
 func rssLimitBytes() uint64 { return 0 }
 
 // monitorGroupRSS 非 darwin 平台不可达（rssLimitBytes 恒 0），stub 仅满足
-// exec_procs.RunProcess 的跨平台编译引用。
+// RunProcess 的跨平台编译引用。
 func monitorGroupRSS(h *procHandle, limit uint64) {}

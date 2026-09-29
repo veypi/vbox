@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var errClosed = errors.New("exec_procs: manager closed")
+var errClosed = errors.New("vbox: manager closed")
 
 // procHandle 是一次原生进程运行的内部句柄（进程组终止与 RSS 监控用）。
 type procHandle struct {

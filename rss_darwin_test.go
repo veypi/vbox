@@ -16,7 +16,7 @@ import (
 // 非零）。注：不能用 os.Getpid() 直接当 pgid——go test 下测试二进制继承
 // go 命令的进程组（job control 以 go 为组长），自身并非组长，ps -g <pid>
 // 匹配不到组即 exit 1（2026-08-31 实测踩坑）；生产路径 pgid==pid 是
-// exec_procs Setpgid 的产物（见 rss_darwin.go 注释）。
+// vbox spawn 置 Setpgid 的产物（见 rss_darwin.go 注释）。
 // 注：CI/沙箱环境可能禁止 fork ps（operation not permitted），skip。
 func TestGroupRSSKB(t *testing.T) {
 	pgid, err := syscall.Getpgid(os.Getpid())

@@ -25,7 +25,7 @@ import (
 
 // runWithPlan 以 launchPlan 启动命令并等待，返回输出与退出码。
 // 三段式 Start → assignJob（Job Object 资源限制生效）→ Wait，
-// 与 exec_procs.Start 同生命周期（spawn 后关闭令牌、进程结束后 cleanup）。
+// 与 Manager.Start 同生命周期（spawn 后关闭令牌、进程结束后 cleanup）。
 func runWithPlan(t *testing.T, plan launchPlan, argv []string, workdir string) (string, int) {
 	t.Helper()
 	if plan.token == 0 {

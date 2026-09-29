@@ -367,8 +367,8 @@ func probeBackend() sandboxBackend {
 //     层不受影响）；ACE 继承到子对象并持久保留，到期对账见持久模型注释）；
 //     模式形态不可实例化或可达对象加不上 ACE → 拒绝执行（fail-closed）
 //   - 资源限制：Job Object（进程内存 4GiB / job 内存 8GiB / 活动进程 256），
-//     spawn 后由 exec_procs assign 子进程（assignJob）；job 句柄随 cleanup 关闭
-//   - 返回原样 argv + 令牌句柄 + job 句柄（spawn 后由 exec_procs 使用/关闭）
+//     spawn 后由 Manager assign 子进程（assignJob）；job 句柄随 cleanup 关闭
+//   - 返回原样 argv + 令牌句柄 + job 句柄（spawn 后由 Manager 使用/关闭）
 //
 // fsOpen（写全放）与网络规则无法用令牌模型表达，已由 validateProcessPolicy
 // 拒绝；fs_allow 通配写授权（writeAllow）同样无法表达——忽略即少授（安全方向）。

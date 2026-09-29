@@ -69,9 +69,9 @@ const (
 // launchPlan 是一次 confined 启动的平台方案：
 //   - argv：替换启动参数（bwrap/seatbelt 包装；windows 原样）
 //   - token：windows 受限令牌句柄（其他平台恒 0；spawn 成功后由
-//     exec_procs 关闭——子进程持有令牌副本）
+//     Manager 关闭——子进程持有令牌副本）
 //   - job：windows Job Object 句柄（资源限制：内存/进程数；其他平台恒 0；
-//     spawn 成功后由 exec_procs assign 子进程，进程结束后随 cleanup 关闭）
+//     spawn 成功后由 Manager assign 子进程，进程结束后随 cleanup 关闭）
 //   - env：附加环境变量（windows：TMP/TEMP 指向私有临时目录）
 //   - cleanup：进程结束后调用（windows：撤销 per-call deny ACE + 删除私有
 //     临时目录 + 关闭 Job Object；其他平台 nil）
@@ -170,7 +170,7 @@ func rlimitArgs() []string {
 // ulimit 设置的 RLIMIT 跨 exec 继承（sandbox-exec 与其最终命令同受约束），
 // 且子进程只能降低不能提高；ulimit 失败即退出（fail-closed，命令不执行）。
 // 注意：macOS 内核不支持 RLIMIT_AS（-v）/RLIMIT_DATA（-d），setrlimit 恒
-// EINVAL（实测 2026-08-28）——大内存分配由 exec_procs 进程组 RSS 监控
+// EINVAL（实测 2026-08-28）——大内存分配由 vbox 进程组 RSS 监控
 // 兜底（rss_darwin.go）。不设 -u（RLIMIT_NPROC 按 UID 全系统计数，桌面
 // 常驻进程即超限，见常量块注释）。单位：-n fd、-t CPU 秒、-f 512B 块、-c core。
 func confineRlimits(argv []string) []string {
