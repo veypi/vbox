@@ -4,9 +4,7 @@ package vbox
 
 import (
 	"context"
-	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 // probeBackend（linux）：bwrap 功能性探测——真跑一次最小只读 profile，
@@ -26,21 +24,11 @@ func probeBackend() sandboxBackend {
 }
 
 // planConfined（linux）：bwrap argv 包装，无令牌。
-// 可写根下的敏感子路径（.git 等）存在时收集为只读覆盖；git 自身豁免
-// （保护对象是 bash/rm 等通用命令，git 等级由 vcore 子命令表承担）。
-// deny 模式先实例化为覆盖目标（形态不可实例化 → 拒绝执行）。
+// deny 模式先实例化为覆盖目标（形态不可实例化 → 拒绝执行）；工作区元数据
+// 保护（.git/.aws）已收敛为 pod 侧内置 ro 行，经 evaluateFSPolicy 回补 ro-bind。
 func planConfined(spec confineSpec) (launchPlan, error) {
 	if selectBackend() == backendUnavailable {
 		return launchPlan{}, sandboxUnavailable()
-	}
-	var protected []string
-	if spec.workdir != "" && !isGitArgv(spec.argv) {
-		for _, name := range protectedMetadataNames {
-			p := filepath.Join(spec.workdir, name)
-			if st, err := os.Stat(p); err == nil && st.IsDir() {
-				protected = append(protected, p)
-			}
-		}
 	}
 	if err := validateProcessPolicy(spec, "linux"); err != nil {
 		return launchPlan{}, err
@@ -49,6 +37,11 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if err != nil {
 		return launchPlan{}, err
 	}
-	// W3：实例化目标按 vbox 快照（first-wins）求值后落措施——ro/rw 洞回补。
-	return launchPlan{argv: bwrapArgs(spec, spec.extra, protected, evaluateDenyTargets(denyTargets, spec.fsRules))}, nil
+	// W3：授权快照经 first-wins 统一求值后落挂载（覆盖/ro/rw 洞与独立 ro
+	// 收紧同出一口）；不可精确表达的 ro 通配行在此拒绝执行。
+	plan, err := evaluateFSPolicy(denyTargets, spec.fsRules, writableMountRoots(spec), spec.fsOpen)
+	if err != nil {
+		return launchPlan{}, err
+	}
+	return launchPlan{argv: bwrapArgs(spec, spec.extra, plan)}, nil
 }

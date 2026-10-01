@@ -360,6 +360,70 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	}
 }
 
+// 独立 ro 行（可写根内）落写拒 ACE：工作区元数据保护形态——.git 写拒、
+// 兄弟路径可写、读放行；与 pod SnapshotForNative 下发的保护行同形态。
+func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
+	oldOverride := denyACLStatePathOverride
+	denyACLStatePathOverride = filepath.Join(t.TempDir(), "deny_acl_state.json")
+	defer func() {
+		denyACLStatePathOverride = oldOverride
+		denyACLMu.Lock()
+		denyACLCache = nil
+		denyACLMu.Unlock()
+	}()
+	denyACLMu.Lock()
+	denyACLCache = nil
+	denyACLMu.Unlock()
+
+	ws := t.TempDir()
+	gitDir := filepath.Join(ws, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	head := filepath.Join(gitDir, "HEAD")
+	const headContent = "ref: refs/heads/main\n"
+	if err := os.WriteFile(head, []byte(headContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	row, ok := CompileFSRule("ro:"+gitDir, ClassBuiltin)
+	if !ok {
+		t.Fatalf("compile ro rule failed: %s", gitDir)
+	}
+	rules := FSRuleSet{Rules: []Rule{row}}
+
+	plan, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: writeCmd(head)})
+	if err != nil {
+		t.Fatalf("planConfined: %v", err)
+	}
+	if got := aclDenyAceCount(t, gitDir); got == 0 {
+		t.Fatalf("ro row should add a deny ACE on %s", gitDir)
+	}
+	out, exit := runWithPlan(t, plan, plan.argv, ws)
+	if exit == 0 {
+		t.Fatalf("ro write under .git should fail: %s", out)
+	}
+	if b, _ := os.ReadFile(head); string(b) != headContent {
+		t.Fatalf("ro file changed: %q", b)
+	}
+	// 兄弟路径可写（ro 只收紧目标子树）。
+	okFile := filepath.Join(ws, "ok.txt")
+	plan2, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: writeCmd(okFile)})
+	if err != nil {
+		t.Fatalf("planConfined: %v", err)
+	}
+	if out2, exit2 := runWithPlan(t, plan2, plan2.argv, ws); exit2 != 0 {
+		t.Fatalf("sibling write should succeed: %s", out2)
+	}
+	// 读放行。
+	plan3, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: []string{"cmd", "/c", "type .git\\HEAD"}})
+	if err != nil {
+		t.Fatalf("planConfined: %v", err)
+	}
+	if out3, exit3 := runWithPlan(t, plan3, plan3.argv, ws); exit3 != 0 || !strings.Contains(out3, "ref: refs/heads/main") {
+		t.Fatalf("ro reads must stay open: exit=%d out=%q", exit3, out3)
+	}
+}
+
 // 持久 deny ACE 对账：换 deny 目标后，不再需要的旧目标被撤销（状态文件对账），
 // 新目标打上；对账只在实例化重算/目标集变化时发生（稳态零 ACL 写）。
 func TestWindowsDenyStaleRevocation(t *testing.T) {

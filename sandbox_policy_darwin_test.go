@@ -63,9 +63,12 @@ func TestSeatbeltFSRulesHoleSemantics(t *testing.T) {
 	if iRo < iDeny {
 		t.Fatalf("ro 洞必须先于 deny 输出被后命中覆盖：ro=%d deny=%d（逆序应 ro 在后）", iRo, iDeny)
 	}
-	// ro 行不开写。
+	// ro 行不开写；写拒必须显式下沉（可写根内宽写放行不会盖掉它；2026-10-01 探针）。
 	if strings.Contains(profile, `(allow file-write* (subpath "/Users/v/.ssh/known_hosts"))`) {
 		t.Fatalf("ro 行不得放行写")
+	}
+	if !strings.Contains(profile, `(deny file-write* (subpath "/Users/v/.ssh/known_hosts"))`) {
+		t.Fatalf("ro 行缺显式写拒\n%s", profile)
 	}
 }
 

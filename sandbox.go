@@ -42,14 +42,10 @@ const (
 	resourceLimitFSize        = 1 << 30
 )
 
-// protectedMetadataNames 是工作区可写时仍保持只读的敏感子路径名
-// （借鉴 codex：.git 防 AI 破坏仓库元数据/历史；可扩展 .agents 等）。
-// 沙箱内 git 写操作（add/commit）会失败——AI 可经审批 9 免沙箱执行。
-// linux 有效性实测（2026-08-14，bwrap / Debian 13）：沙箱内嵌套
-// `unshare -rm` 后 umount ro-bind 覆盖、re-bind 工作区两种逃逸均被内核
-// 挂载归属规则拒绝（挂载属于父 userns，嵌套 ns 内无 CAP_SYS_ADMIN 可操作）
-// ——ro-bind 覆盖是有效边界，非纸面加固。
-var protectedMetadataNames = []string{".git"}
+// 工作区元数据保护（.git/.aws 只读）曾以 protectedMetadataNames 专路实现；
+// 2026-10-01 收敛为 pod 侧内置 ro 行（aic-pod fsauth.SnapshotForNative）：
+// 三平台统一经规则表求值/落地，git 命令豁免（argv[0] basename 判据）同交 pod。
+// ro-bind 覆盖的 linux 有效性实测见 aic-pod 记录（2026-08-14，Debian 13）。
 
 // publicRoots 返回公共可写区（pod 侧 $HOME/.aic，经 PublicRootsFn 注入）：
 // workspace-write 白名单成员之一，与工作区/缓存/临时区并列——AI 跨会话保存产物
@@ -146,10 +142,8 @@ func sandboxUnavailable() error {
 //   - workspace-write（level 2/3/4）：/tmp 换 tmpfs（全新空目录，临时文件
 //     不落盘）+ 工作区可写 bind + 缓存目录（cacheDirs，cacheRoots 采集）
 //     逐个可写 bind
-//   - protectedReadonly：可写根下的敏感子路径（.git 等）以 --ro-bind 覆盖
-//     为只读（bwrap 后绑定覆盖前绑定）
-//   - denyTargets：deny 模式实例化后的覆盖目标（不存在的目标已在实例化时
-//     跳过）
+//   - deny 隔离覆盖（§5.10）与 ro/rw 洞回补：evaluateFSPolicy 求值后按深度
+//     排序输出（后绑定覆盖先绑定）
 //   - read-only（level 1）：无任何可写挂载（/dev/null 由 --dev 提供）
 //
 // rlimitArgs 构建 bwrap 资源限制参数段（--rlimit TYPE VALUE ...）。
@@ -180,7 +174,7 @@ func confineRlimits(argv []string) []string {
 	return append([]string{"/bin/sh", "-c", script, "sh"}, argv...)
 }
 
-func bwrapArgs(spec confineSpec, cacheDirs []string, protectedReadonly []string, deny denyMountPlan) []string {
+func bwrapArgs(spec confineSpec, cacheDirs []string, deny denyMountPlan) []string {
 	// 读默认开放：整机 ro-bind 读视图；fs_policy=open（写级）整机 rw bind。
 	// deny 覆盖挂载在末尾追加，恒优先。
 	args := []string{"bwrap"}
@@ -204,94 +198,152 @@ func bwrapArgs(spec confineSpec, cacheDirs []string, protectedReadonly []string,
 			args = append(args, "--bind", d, d)
 		}
 	}
-	for _, p := range protectedReadonly {
-		if p != "" {
-			args = append(args, "--ro-bind", p, p)
-		}
-	}
 	// deny 隔离覆盖（§5.10）：后挂载优先（bwrap 后绑定覆盖前绑定），
 	// 追加在全部 bind 之后；read-only 与 workspace-write 同隔离。
 	args = append(args, deny.args()...)
 	return append(append(args, "--"), spec.argv...)
 }
 
-// denyMountPlan 实例化 deny 目标经 first-wins 求值后的内核处置计划（W3）。
+// denyMountPlan 授权快照经 first-wins 求值后的内核处置计划（W3）。
 type denyMountPlan struct {
 	cover []string // 终局 deny：覆盖挂载（目录 tmpfs / 文件·socket 以 /dev/null ro-bind）
-	ro    []string // 终局 ro：--ro-bind 回补（可读不可写）
-	rw    []string // 终局 rw：--bind 回补（覆盖失效，与快照终局一致）
+	ro    []string // 终局 ro：--ro-bind（可读不可写）
+	rw    []string // 终局 rw：--bind（覆盖失效，与快照终局一致）
 }
 
-// args 按序输出挂载参数：cover 覆盖先行，ro/rw 洞回补在后（后绑定覆盖先绑定）。
+// args 输出挂载参数：按路径深度浅→深排序（bwrap 后绑定覆盖先绑定——嵌套
+// 路径深层必须后挂，否则浅层后挂会把深层挂载一并遮蔽）；同深度按
+// cover → ro → rw 定序。同一路径经求值只出一个动作（evaluateFSPolicy
+// 按 canonical 路径去重）。
 func (p denyMountPlan) args() []string {
-	var args []string
+	type mount struct {
+		path string
+		kind int // 0=cover 1=ro 2=rw
+	}
+	mounts := make([]mount, 0, len(p.cover)+len(p.ro)+len(p.rw))
 	for _, t := range p.cover {
-		args = append(args, overlayArgs(t)...)
+		mounts = append(mounts, mount{t, 0})
 	}
 	for _, t := range p.ro {
-		args = append(args, bindIfExists(t, true)...)
+		mounts = append(mounts, mount{t, 1})
 	}
 	for _, t := range p.rw {
-		args = append(args, bindIfExists(t, false)...)
+		mounts = append(mounts, mount{t, 2})
+	}
+	sort.SliceStable(mounts, func(i, j int) bool {
+		di, dj := pathDepth(mounts[i].path), pathDepth(mounts[j].path)
+		if di != dj {
+			return di < dj
+		}
+		return mounts[i].kind < mounts[j].kind
+	})
+	var args []string
+	for _, m := range mounts {
+		switch m.kind {
+		case 0:
+			args = append(args, overlayArgs(m.path)...)
+		case 1:
+			args = append(args, bindIfExists(m.path, true)...)
+		default:
+			args = append(args, bindIfExists(m.path, false)...)
+		}
 	}
 	return args
 }
 
-// evaluateDenyTargets 按 vbox 快照（first-wins）求值每个实例化 deny 目标的
-// 终局效果（W3，permission_rules §5「先求值后落措施」）：终局 deny → 覆盖；
-// 终局 ro（写拒读放）→ ro-bind 回补；终局 rw → rw-bind 回补。rules 为空 =
-// 全部覆盖（旧行为，fail-closed）。随后补嵌套洞（ro/rw 行字面前缀落在终局
-// deny 目标子树内的按序回补）。
-func evaluateDenyTargets(targets []string, rules *FSRuleSet) denyMountPlan {
-	var plan denyMountPlan
-	for _, t := range targets {
-		if rules == nil {
-			plan.cover = append(plan.cover, t)
-			continue
-		}
-		if rules.Match(t, OpWrite).Allow {
-			plan.rw = append(plan.rw, t)
-			continue
-		}
-		if rules.Match(t, OpRead).Allow {
-			plan.ro = append(plan.ro, t)
-		} else {
-			plan.cover = append(plan.cover, t)
-		}
-	}
-	if rules != nil {
-		// 嵌套洞比较两侧同口径 canonical（生产快照行已 canonical；目标来自
-		// 实例化名单可能含字面形——macOS firmlink 下两侧错位会漏回补）。
-		canonCover := make([]string, len(plan.cover))
-		for i, c := range plan.cover {
-			canonCover[i] = Canonical(c)
-		}
-		ro, rw := nestedDenyHoles(rules.Rules, canonCover)
-		plan.ro = append(plan.ro, ro...)
-		plan.rw = append(plan.rw, rw...)
-	}
-	return plan
+// pathDepth 路径段数（挂载排序用深度）。
+func pathDepth(p string) int {
+	return strings.Count(filepath.ToSlash(strings.TrimSuffix(p, "/")), "/")
 }
 
-// nestedDenyHoles 求嵌套洞：ro/rw 行的字面前缀落在终局 deny 目标子树内——
-// 目标整树被覆盖后按序回补（bwrap 后绑定覆盖先绑定；洞源不存在由
-// bindIfExists 跳过，声明仅工具层生效）。
-func nestedDenyHoles(rows []Rule, cover []string) (ro, rw []string) {
-	for _, r := range rows {
+// evaluateFSPolicy 是「先求值后落措施」（W3，permission_rules §5）的单一
+// 入口：候选路径 = deny 实例化目标 ∪ 规则表 ro/rw 字面行中落在覆盖目标/
+// 可写根之下（fsOpen 时任意位置）者；每个候选经 first-wins Match 求终局——
+// 终局 deny → 覆盖；ro（写拒读放）→ ro-bind；rw → rw-bind。每路径只出一
+// 个动作，天然消除「同路径先 ro 后 rw」的行序失真与独立 ro 规则遗漏。
+// rules 为空 = deny 目标全覆盖（旧行为，fail-closed）。
+//
+// ro/rw 通配行无法以挂载精确表达（字面前缀不是该行的真实作用域）：ro 通配
+// 行落在可写根之下或 fsOpen 时返回错误、启动前拒绝执行（该方向沙箱比
+// matcher 宽松，必须 fail-closed，与 deny 不可实例化同口径）；rw 通配行与
+// 覆盖目标内的 ro 通配行属「沙箱更严」的安全方向，跳过（仅工具层生效）。
+func evaluateFSPolicy(targets []string, rules *FSRuleSet, writable []string, fsOpen bool) (denyMountPlan, error) {
+	var plan denyMountPlan
+	if rules == nil {
+		plan.cover = append(plan.cover, targets...)
+		return plan, nil
+	}
+	seen := map[string]bool{}
+	// 覆盖目标逐个求终局；两侧同口径 canonical（生产快照行已 canonical；
+	// 目标来自实例化名单可能含字面形——macOS firmlink 下两侧错位会漏判）。
+	canonCover := make([]string, 0, len(targets))
+	for _, t := range targets {
+		seen[Canonical(t)] = true
+		switch {
+		case rules.Match(t, OpWrite).Allow:
+			plan.rw = append(plan.rw, t)
+		case rules.Match(t, OpRead).Allow:
+			plan.ro = append(plan.ro, t)
+		default:
+			plan.cover = append(plan.cover, t)
+			canonCover = append(canonCover, Canonical(t))
+		}
+	}
+	canonWritable := make([]string, 0, len(writable))
+	for _, w := range writable {
+		if w = Canonical(w); w != "" {
+			canonWritable = append(canonWritable, w)
+		}
+	}
+	// 需显式挂载 = 基底可写性与终局判定可能不一致：落在可写根/fsOpen 之下
+	// （基底可写）或覆盖目标之下（整树被遮、洞需回补）。
+	needsMount := func(cpath string) bool {
+		return fsOpen || underAnyPath(cpath, canonCover) || underAnyPath(cpath, canonWritable)
+	}
+	var globs []string
+	for _, r := range rules.Rules {
 		if r.Effect == EffDeny {
 			continue
 		}
-		lit := literalPrefix(r.Pattern)
-		if lit == "" || !underAnyPath(lit, cover) {
+		if strings.ContainsAny(r.Pattern, "*?") {
+			// ro 通配行收紧可写基底而挂载层无法表达 → 拒启；其余方向安全。
+			if r.Effect == EffRO {
+				if lit := literalPrefix(r.Pattern); lit == "" || fsOpen || underAnyPath(Canonical(lit), canonWritable) {
+					globs = append(globs, r.Pattern)
+				}
+			}
 			continue
 		}
-		if r.Effect == EffRO {
-			ro = append(ro, lit)
-		} else {
-			rw = append(rw, lit)
+		cpath := Canonical(r.Pattern)
+		if seen[cpath] || !needsMount(cpath) {
+			continue
+		}
+		seen[cpath] = true
+		switch {
+		case rules.Match(cpath, OpWrite).Allow:
+			// rw：仅在覆盖目标之内才是洞（可写根内本就 rw，无需重复挂载）。
+			if underAnyPath(cpath, canonCover) {
+				plan.rw = append(plan.rw, cpath)
+			}
+		case rules.Match(cpath, OpRead).Allow:
+			// ro：可写基底或覆盖目标内都需显式 ro-bind 收紧。
+			plan.ro = append(plan.ro, cpath)
+		default:
+			// 终局 deny 的 ro/rw 行（被后续 deny 行压中）：无需动作——
+			// deny 目标由 DenyPatterns 全量实例化，不在目标内即不受遮。
 		}
 	}
-	return
+	if len(globs) > 0 {
+		return plan, &DeniedError{Reason: "sandbox cannot enforce host policy: inexpressible ro glob rule(s): " + strings.Join(globs, " ")}
+	}
+	return plan, nil
+}
+
+// writableMountRoots 返回 linux 挂载层的可写根（bwrapArgs 实际 rw 绑定的
+// 路径 + /tmp tmpfs）——evaluateFSPolicy 据此判定哪些 ro 行需显式挂载收紧。
+func writableMountRoots(spec confineSpec) []string {
+	roots := append(append([]string{}, spec.extra...), literalWriteRoots(spec.writeAllow)...)
+	return append(roots, "/tmp")
 }
 
 // literalPrefix 取 glob 模式的字面前缀（首个通配段之前；无通配 = 整串；
@@ -690,8 +742,12 @@ func seatbeltArgs(spec confineSpec) []string {
 					"(deny file-write* "+filter+")",
 					"(deny network-outbound (remote unix "+filter+"))")
 			case EffRO:
+				// ro = 写拒读放：写拒必须显式下沉——否则可写根内的宽写放行（后
+				// 输出、后命中）会把 ro 洞盖掉（2026-10-01 探针实测：仅 allow
+				// file-read* 时，可写根内 ro 路径的写照常放行）。
 				forms = append(forms,
 					"(allow file-read* "+filter+")",
+					"(deny file-write* "+filter+")",
 					"(allow network-outbound (remote unix "+filter+"))")
 			case EffRW:
 				forms = append(forms,
@@ -709,12 +765,6 @@ func seatbeltArgs(spec confineSpec) []string {
 			forms = append(forms, "(deny file-read* (regex "+re+"))")
 			forms = append(forms, "(deny file-write* (regex "+re+"))")
 			forms = append(forms, "(deny network-outbound (remote unix (regex "+re+")))")
-		}
-	}
-	if spec.workdir != "" && !isGitArgv(spec.argv) {
-		for _, name := range protectedMetadataNames {
-			p := filepath.Join(spec.workdir, name)
-			forms = append(forms, "(deny file-write* (subpath "+sbplString(canonicalRoot(p))+"))")
 		}
 	}
 	return append([]string{macosSeatbeltExecutable, "-p", stringsJoin(forms), "--"}, spec.argv...)
@@ -815,28 +865,6 @@ func isLoopbackHost(h string) bool {
 
 func stringsJoin(forms []string) string {
 	return strings.Join(forms, " ")
-}
-
-// canonicalRoot 消解路径到真实文件系统身份（symlink/.. 展开；失败回落绝对路径）。
-func canonicalRoot(p string) string {
-	if r, err := filepath.EvalSymlinks(p); err == nil {
-		return r
-	}
-	if abs, err := filepath.Abs(p); err == nil {
-		return abs
-	}
-	return p
-}
-
-// isGitArgv 判定被包装命令是否为 git 自身（argv[0] basename 匹配）。
-// .git 只读覆盖的保护对象是 bash/rm 等通用命令，git 不应被误伤；
-// bash -c "git ..." 不豁免（走 git 命令本身，或审批 9 免沙箱）。
-func isGitArgv(argv []string) bool {
-	if len(argv) == 0 {
-		return false
-	}
-	base := filepath.Base(argv[0])
-	return base == "git" || base == "git.exe"
 }
 
 // existingDirs 过滤掉空串与不存在的目录（bwrap --bind / windows grantDirWrite

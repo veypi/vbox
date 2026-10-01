@@ -401,7 +401,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	var tmpDir string
 	var grantD, tmpD time.Duration
 	// fs deny：稳定 SID + 持久拒绝 ACE（幂等 ensure；不按进程撤销）
-	denySid, err := ensureDenyACEs(spec.deny, spec.fsRules, logf)
+	denySid, err := ensureDenyACEs(spec.deny, spec.fsRules, spec.extra, logf)
 	if err != nil {
 		return launchPlan{}, err
 	}
@@ -738,8 +738,8 @@ func denyParallelPaths(paths []string, fn func(i int, path string) error) error 
 //
 // 返回 deny SID（无目标 = nil，此时无需放进 restricting list）与错误：
 // 可达对象加不上 ACE → fail-closed（命令不执行；已打上的 ACE 保留并落状态）。
-func ensureDenyACEs(patterns []string, rules *FSRuleSet, logf func(string, ...any)) (*windows.SID, error) {
-	if len(patterns) == 0 {
+func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf func(string, ...any)) (*windows.SID, error) {
+	if len(patterns) == 0 && rules == nil {
 		return nil, nil
 	}
 	sid, err := stableDenySID()
@@ -751,16 +751,24 @@ func ensureDenyACEs(patterns []string, rules *FSRuleSet, logf func(string, ...an
 		return nil, err
 	}
 	if rules != nil {
-		// W3：实例化目标按 vbox 快照（first-wins）求值——终局 rw 的目标跳过
-		// ACE（内核放行，与快照终局一致）；ro 与 deny 仍落 ACE（windows
+		// W3：授权快照经 first-wins 统一求值——终局 rw 的目标跳过 ACE
+		// （内核放行，与快照终局一致）；ro 与 deny 仍落 ACE（windows
 		// per-call ACE = 写拒/读放，与 ro 语义一致；读侧 deny 是文档化边界）。
-		// 嵌套洞内核不可落——仅工具层生效。
-		plan := evaluateDenyTargets(targets, rules)
+		// 独立 ro 行（落在可写白名单根之下）同口径补 ACE；嵌套洞内核不可落
+		// ——仅工具层生效。不可精确表达的 ro 通配行在此拒绝执行。
+		plan, err := evaluateFSPolicy(targets, rules, writable, false)
+		if err != nil {
+			return nil, err
+		}
 		targets = append(append([]string{}, plan.cover...), plan.ro...)
 		if len(plan.rw) > 0 && logf != nil {
 			logf("sandbox: deny ACE skip rw-hole targets=%d", len(plan.rw))
 		}
 	}
+	// 策略层 → ACL 边界的路径形态统一：ro 行经 evaluateFSPolicy 产出 /c/ 规范形
+	// （canonical），Win32 安全 API 只认原生态路径——不转换会被静默跳过（对象
+	// 不可读口径），ro 行 ACE 永不落地。deny 实例化目标在此已是原生态，转换幂等。
+	targets = pathsToOS(targets)
 	if len(targets) == 0 {
 		return nil, nil
 	}

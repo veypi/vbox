@@ -107,7 +107,7 @@ func TestUnconfinedIgnoresPolicy(t *testing.T) {
 func TestBwrapArgs(t *testing.T) {
 	argv := []string{"bash", "-c", "echo hi"}
 	spec := confineSpec{workdir: "/ungranted", argv: argv, netOpen: true}
-	got := bwrapArgs(spec, []string{"/workspace"}, nil, denyMountPlan{})
+	got := bwrapArgs(spec, []string{"/workspace"}, denyMountPlan{})
 	if !contains(got, "--ro-bind", "/", "/") || contains(got, "--tmpfs", "/") {
 		t.Fatalf("read-open root required (ro-bind /): %v", got)
 	}
@@ -119,8 +119,8 @@ func TestBwrapArgs(t *testing.T) {
 	}
 }
 
-// seatbelt 包装：工作区 + 平台临时区 + 缓存目录（全部 canonicalize）+
-// .git deny 覆盖；git 自身豁免 .git 覆盖。
+// seatbelt 包装：工作区 + 平台临时区 + 缓存目录（全部 canonicalize）。
+// （工作区元数据保护已收敛为 pod 侧 ro 行，不再在本包特判。）
 func TestSeatbeltArgs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix path semantics")
@@ -137,14 +137,9 @@ func TestSeatbeltArgs(t *testing.T) {
 			t.Fatalf("workspace-write profile missing %q: %s", want, profile)
 		}
 	}
-	// .git 敏感子路径 deny 覆盖（SBPL deny 优先于 allow）
-	if !strings.Contains(profile, `(deny file-write* (subpath "`+canonicalRoot("/ws/.git")+`"))`) {
-		t.Fatalf("workspace-write profile missing .git deny: %s", profile)
-	}
-	// git 自身豁免 .git 覆盖（保护对象是 bash/rm 等通用命令）
-	gw := seatbeltArgs(confineSpec{workdir: "/ws", argv: []string{"git", "commit", "-m", "x"}, netOpen: true})
-	if strings.Contains(gw[2], "deny file-write* (subpath") {
-		t.Fatalf("git invocation should be exempt from .git deny: %s", gw[2])
+	// 本包不再特判工作区元数据（保护行由 pod 决定是否下发）。
+	if strings.Contains(profile, ".git") {
+		t.Fatalf("vbox must not special-case workspace metadata: %s", profile)
 	}
 }
 
@@ -246,7 +241,8 @@ func TestSeatbeltDenyWinsOverWriteAllow(t *testing.T) {
 
 // TestSeatbeltRuleOrderEmission：fsRules（vbox first-wins 快照）非空 = 逆序
 // 输出映射 SBPL 后规则胜（2026-09-29 W2b）：首命中行最后输出——deny 三形态
-// 照旧；ro/rw 洞（表中在 deny 前）输出在其后，内核可读/可写真实生效。
+// 照旧；ro/rw 洞（表中在 deny 前）输出在其后，内核可读/可写真实生效；
+// ro 行的写拒随行显式下沉（不依赖更宽写放行的缺席）。
 // 裸模式输出 subpath 形态，glob 输出 regex。
 func TestSeatbeltRuleOrderEmission(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -280,12 +276,16 @@ func TestSeatbeltRuleOrderEmission(t *testing.T) {
 	if strings.Contains(profile, `(allow file-write* (subpath "/probe/readonly"))`) {
 		t.Fatalf("ro row must not allow write: %s", profile)
 	}
+	// ro 行的写拒必须显式下沉（可写根内的宽写放行会盖掉隐式拒；2026-10-01 实测）。
+	if !strings.Contains(profile, `(deny file-write* (subpath "/probe/readonly"))`) {
+		t.Fatalf("ro row must carry explicit write denial: %s", profile)
+	}
 }
 
-// evaluateDenyTargets（W3）：first-wins 求值后落措施——cfg rw 覆盖 builtin
+// evaluateFSPolicy（W3）：first-wins 求值后落措施——cfg rw 覆盖 builtin
 // deny 的目标回补 rw bind；ro 洞回补 ro-bind；嵌套洞按字面前缀回补；
 // nil rules = 全覆盖（旧行为）。
-func TestEvaluateDenyTargets(t *testing.T) {
+func TestEvaluateFSPolicy(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
 	ssh := filepath.Join(base, ".ssh")
@@ -294,7 +294,10 @@ func TestEvaluateDenyTargets(t *testing.T) {
 	targets := []string{ssh, aws, gpg}
 
 	// nil rules：全覆盖（fail-closed 旧行为）。
-	plan := evaluateDenyTargets(targets, nil)
+	plan, err := evaluateFSPolicy(targets, nil, nil, false)
+	if err != nil {
+		t.Fatalf("nil rules 不应报错：%v", err)
+	}
 	if len(plan.cover) != 3 || len(plan.ro) != 0 || len(plan.rw) != 0 {
 		t.Fatalf("nil rules 应全覆盖：%+v", plan)
 	}
@@ -309,7 +312,10 @@ func TestEvaluateDenyTargets(t *testing.T) {
 		{Pattern: "**/.aws/**", Effect: EffDeny, Class: ClassBuiltin},
 		{Pattern: "**/.gnupg/**", Effect: EffDeny, Class: ClassBuiltin},
 	}, EffDeny)
-	plan = evaluateDenyTargets(targets, &snap)
+	plan, err = evaluateFSPolicy(targets, &snap, nil, false)
+	if err != nil {
+		t.Fatalf("字面规则不应报错：%v", err)
+	}
 	if len(plan.cover) != 1 || plan.cover[0] != ssh {
 		t.Fatalf("cover 应只剜 .ssh：%+v", plan.cover)
 	}
@@ -321,15 +327,143 @@ func TestEvaluateDenyTargets(t *testing.T) {
 	}
 }
 
-func TestEvaluateDenyTargetsNoMatchMeansCover(t *testing.T) {
+// 独立 ro 规则：可写根内的只读子目录必须落入挂载计划（修复前 matcher
+// 拒写而挂载计划不收紧，沙箱比 matcher 宽松）。
+func TestEvaluateFSPolicyIndependentRO(t *testing.T) {
 	t.Parallel()
-	// 表内无放行行命中：deny 目标保持覆盖。
+	base := t.TempDir()
+	ws := filepath.Join(base, "ws")
+	data := filepath.Join(ws, "data")
+	cache := filepath.Join(ws, "cache")
 	snap := NewFSRuleSet([]Rule{
-		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
+		{Pattern: data, Effect: EffRO, Class: ClassCfg},
 	}, EffDeny)
-	plan := evaluateDenyTargets([]string{"/home/v/.ssh"}, &snap)
-	if len(plan.cover) != 1 || len(plan.ro) != 0 || len(plan.rw) != 0 {
-		t.Fatalf("未命中放行应保持覆盖：%+v", plan)
+	plan, err := evaluateFSPolicy(nil, &snap, []string{ws}, false)
+	if err != nil {
+		t.Fatalf("独立 ro 不应报错：%v", err)
+	}
+	if len(plan.ro) != 1 || plan.ro[0] != Canonical(data) {
+		t.Fatalf("可写根内的 ro 行应落入计划：%+v", plan.ro)
+	}
+	if len(plan.cover) != 0 || len(plan.rw) != 0 {
+		t.Fatalf("不应有多余动作：%+v", plan)
+	}
+	// 可写根外的 ro 行（基底已只读）无需挂载。
+	plan, err = evaluateFSPolicy(nil, &snap, nil, false)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if len(plan.ro) != 0 {
+		t.Fatalf("基底只读下 ro 行无需挂载：%+v", plan.ro)
+	}
+	// rw 行在可写根内是冗余（不重复挂载）；rw 洞只在覆盖目标内回补。
+	snapRW := NewFSRuleSet([]Rule{
+		{Pattern: cache, Effect: EffRW, Class: ClassCfg},
+	}, EffDeny)
+	plan, err = evaluateFSPolicy(nil, &snapRW, []string{ws}, false)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if len(plan.rw) != 0 {
+		t.Fatalf("可写根内 rw 冗余应跳过：%+v", plan.rw)
+	}
+}
+
+// 同路径先 ro 后 rw：matcher first-wins 终局 ro，计划只能出一个 ro-bind
+// （修复前行序直译，ro-bind 后再 rw-bind 后者覆盖前者，写实际放行）。
+func TestEvaluateFSPolicyFirstWinsOrder(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	ws := filepath.Join(base, "ws")
+	data := filepath.Join(ws, "data")
+	snap := NewFSRuleSet([]Rule{
+		{Pattern: data, Effect: EffRO, Class: ClassCfg},
+		{Pattern: data, Effect: EffRW, Class: ClassCfg},
+	}, EffDeny)
+	plan, err := evaluateFSPolicy(nil, &snap, []string{ws}, false)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if len(plan.ro) != 1 || len(plan.rw) != 0 {
+		t.Fatalf("同路径 first-wins 应只出 ro：%+v", plan)
+	}
+	// 反序：rw 先命中 → 可写根内冗余，不出任何动作。
+	snap2 := NewFSRuleSet([]Rule{
+		{Pattern: data, Effect: EffRW, Class: ClassCfg},
+		{Pattern: data, Effect: EffRO, Class: ClassCfg},
+	}, EffDeny)
+	plan, err = evaluateFSPolicy(nil, &snap2, []string{ws}, false)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if len(plan.ro) != 0 || len(plan.rw) != 0 {
+		t.Fatalf("rw 先命中在可写根内应无动作：%+v", plan)
+	}
+}
+
+// fsOpen：整机可写基底，ro 行无处也必须落入计划。
+func TestEvaluateFSPolicyOpenMode(t *testing.T) {
+	t.Parallel()
+	secret := filepath.Join(t.TempDir(), "secret")
+	snap := NewFSRuleSet([]Rule{
+		{Pattern: secret, Effect: EffRO, Class: ClassCfg},
+	}, EffRW)
+	plan, err := evaluateFSPolicy(nil, &snap, nil, true)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if len(plan.ro) != 1 || plan.ro[0] != Canonical(secret) {
+		t.Fatalf("fsOpen 下 ro 行应落入计划：%+v", plan.ro)
+	}
+}
+
+// ro 通配行落在可写根/fsOpen 下无法以挂载精确表达 → 拒绝启动；落在只读
+// 基底（安全方向）与 rw 通配行（沙箱更严）不拒绝。
+func TestEvaluateFSPolicyROGlobRejected(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	ws := filepath.Join(base, "ws")
+	snap := NewFSRuleSet([]Rule{
+		{Pattern: filepath.Join(ws, "*.secret"), Effect: EffRO, Class: ClassCfg},
+	}, EffDeny)
+	if _, err := evaluateFSPolicy(nil, &snap, []string{ws}, false); err == nil {
+		t.Fatal("可写根内的 ro 通配行应拒绝启动")
+	}
+	if _, err := evaluateFSPolicy(nil, &snap, nil, true); err == nil {
+		t.Fatal("fsOpen 下 ro 通配行应拒绝启动")
+	}
+	if _, err := evaluateFSPolicy(nil, &snap, nil, false); err != nil {
+		t.Fatalf("只读基底下 ro 通配行无需挂载，不应拒绝：%v", err)
+	}
+	snapRW := NewFSRuleSet([]Rule{
+		{Pattern: filepath.Join(ws, "*/logs"), Effect: EffRW, Class: ClassCfg},
+	}, EffDeny)
+	if _, err := evaluateFSPolicy(nil, &snapRW, []string{ws}, false); err != nil {
+		t.Fatalf("rw 通配行属安全方向，不应拒绝：%v", err)
+	}
+}
+
+// 挂载排序：深层路径必须后挂（bwrap 后绑定覆盖先绑定——浅层后挂会把深层
+// 挂载一并遮蔽）。
+func TestBwrapDenyPlanArgDepthOrder(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	shallow := filepath.Join(tmp, "ro")
+	deep := filepath.Join(tmp, "ro", "sub", "denied")
+	for _, d := range []string{shallow, deep} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := denyMountPlan{cover: []string{deep}, ro: []string{shallow}}
+	args := strings.Join(plan.args(), " ")
+	iRO := strings.Index(args, "--ro-bind "+shallow+" "+shallow)
+	iCover := strings.Index(args, "--tmpfs "+deep)
+	if iRO < 0 || iCover < 0 {
+		t.Fatalf("形态缺失：%s", args)
+	}
+	if iRO > iCover {
+		t.Fatalf("浅层 ro 必须先于深层 cover：%s", args)
 	}
 }
 
@@ -416,7 +550,11 @@ func TestBwrapDenyArgs(t *testing.T) {
 
 	overlayFor := func(pat string) []string {
 		t.Helper()
-		return evaluateDenyTargets(mustDenyTargets(t, []string{pat}), nil).args()
+		plan, err := evaluateFSPolicy(mustDenyTargets(t, []string{pat}), nil, nil, false)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		return plan.args()
 	}
 	if got := overlayFor(file); !contains(got, "--ro-bind", "/dev/null", file) {
 		t.Fatalf("literal file cover missing: %v", got)
@@ -675,24 +813,6 @@ func TestConfineRlimits(t *testing.T) {
 	}
 }
 
-// isGitArgv 只认 argv[0] basename 为 git；shell 包装不豁免。
-func TestIsGitArgv(t *testing.T) {
-	for _, argv := range [][]string{
-		{"git", "status"}, {"git", "checkout", "main"}, {"/usr/bin/git", "log"},
-	} {
-		if !isGitArgv(argv) {
-			t.Fatalf("isGitArgv(%v) = false, want true", argv)
-		}
-	}
-	for _, argv := range [][]string{
-		{"bash", "-c", "git commit"}, {"sh", "-c", "rm -rf .git"}, {"git-lfs", "pull"}, nil,
-	} {
-		if isGitArgv(argv) {
-			t.Fatalf("isGitArgv(%v) = true, want false", argv)
-		}
-	}
-}
-
 // seatbelt 网络管控段（net_policy=deny 锁定模式）：deny inbound/outbound 打底 +
 // loopback localhost 两形态（remote 连通 + local inbound bind/listen）+
 // 非 loopback 条目退化 *:port（2026-09-07 实测：host 必须为 */localhost；
@@ -754,16 +874,16 @@ func TestSeatbeltNetForms(t *testing.T) {
 func TestBwrapNetAndFsOpen(t *testing.T) {
 	argv := []string{"bash", "-c", "echo hi"}
 
-	deny := bwrapArgs(confineSpec{workdir: "/ws", argv: argv}, nil, nil, denyMountPlan{})
+	deny := bwrapArgs(confineSpec{workdir: "/ws", argv: argv}, nil, denyMountPlan{})
 	if !contains(deny, "--unshare-net") {
 		t.Fatalf("deny mode missing --unshare-net: %v", deny)
 	}
-	open := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true}, nil, nil, denyMountPlan{})
+	open := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true}, nil, denyMountPlan{})
 	if contains(open, "--unshare-net") {
 		t.Fatalf("open mode should not unshare net: %v", open)
 	}
 	// fsOpen：--bind / /（读开放 + 写全放）
-	fsOpen := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, fsOpen: true}, nil, nil, denyMountPlan{})
+	fsOpen := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, fsOpen: true}, nil, denyMountPlan{})
 	if !contains(fsOpen, "--bind", "/", "/") {
 		t.Fatalf("fs_open should rw-bind root: %v", fsOpen)
 	}

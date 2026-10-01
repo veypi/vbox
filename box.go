@@ -19,9 +19,11 @@ type Policy struct {
 // Caps 平台沙箱表达能力。
 type Caps struct {
 	// OrderedFSRules：内核可表达行序洞（ro/rw 洞真实生效）——darwin seatbelt
-	// 逆序映射全表；linux bwrap 先求值后落措施（W3：可实例化目标的 ro/rw 洞
-	// 回补，不可实例化条目 fail-closed）；windows 仅 rw 洞可落（跳过 ACE），
-	// ro/嵌套洞仅进程内门放行。
+	// 逆序映射全表；linux bwrap 先求值后落措施（W3 单一入口 evaluateFSPolicy：
+	// 可实例化目标的 ro/rw 洞回补 + 可写根内独立 ro 行收紧，不可精确表达的
+	// ro 通配行 fail-closed）；windows 仅 rw 洞可落（跳过 ACE）+ 可写白名单
+	// 根内独立 ro 行补拒绝 ACE（2026-10-01 路径形态修复后实际生效），
+	// 嵌套洞仅进程内门放行。
 	OrderedFSRules bool
 	// NetPerProcess：可在子进程粒度表达网络规则（darwin 仅 loopback 精确，
 	// 不可表达条目启动前拒绝——沿用 pod 现状语义）。
