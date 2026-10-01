@@ -56,8 +56,9 @@ var (
 
 	// Win10+ 将安全 API 迁移到 API set（api-ms-win-security-*），advapi32 仅
 	// 部分转发（实测 Win11 26200：CreateRestrictedToken 在 advapi32）。
-	// ACL API（SetEntriesInAcl/SetNamedSecurityInfo）走 x/sys 封装
-	// （zsyscall 静态绑定 advapi32.SetEntriesInAclW），不在此手写。
+	// ACL 读写（SetEntriesInAcl / Get/SetSecurityInfo 句柄版）走 x/sys 封装
+	// （zsyscall 静态绑定 advapi32），不在此手写；对象一律经 \\?\ 前缀句柄
+	// 打开（长路径安全，见 aclOpenObject）。
 	securityBaseDll = windows.NewLazySystemDLL("api-ms-win-security-base-l1-2-0.dll")
 
 	procCreateRestrictedToken = findProcAny("CreateRestrictedToken", advapi32, kernel32, securityBaseDll)
@@ -263,11 +264,63 @@ func userSidOf(token windows.Token) (*windows.SID, error) {
 	return user.User.Sid, nil
 }
 
+// aclObjectPath 把原生态路径规整为长路径安全形态（\\?\ 前缀）：绕过
+// MAX_PATH 限制——注册表 LongPathsEnabled=0 的机器上，无前缀的 >260 字符
+// 路径在 Win32 层直接失败（本机注册表已开，见 permission_rules/测试）。
+func aclObjectPath(path string) string {
+	p := strings.ReplaceAll(path, "/", `\`)
+	if strings.HasPrefix(p, `\\?\`) {
+		return p
+	}
+	if strings.HasPrefix(p, `\\`) { // UNC：\\server\share → \\?\UNC\server\share
+		return `\\?\UNC\` + strings.TrimPrefix(p, `\\`)
+	}
+	if len(p) >= 3 && p[1] == ':' && p[2] == '\\' {
+		return `\\?\` + filepath.Clean(p)
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return aclObjectPath(abs)
+	}
+	return p
+}
+
+// aclOpenObject 打开对象句柄（共享全开；目录需 FILE_FLAG_BACKUP_SEMANTICS，
+// 文件无害）。不显式穿透/驻留重解析点，与命名 API 的路径解析口径一致。
+func aclOpenObject(path string, access uint32) (windows.Handle, error) {
+	p, err := windows.UTF16PtrFromString(aclObjectPath(path))
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	return windows.CreateFile(p, access,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+}
+
+// aclReadDACL 经对象句柄读 DACL（长路径安全；READ_CONTROL）。
+func aclReadDACL(path string) (*windows.SECURITY_DESCRIPTOR, error) {
+	h, err := aclOpenObject(path, windows.READ_CONTROL)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(h)
+	return windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+}
+
+// aclWriteDACL 经对象句柄写 DACL（长路径安全；WRITE_DAC）。
+func aclWriteDACL(path string, dacl *windows.ACL) error {
+	h, err := aclOpenObject(path, windows.READ_CONTROL|windows.WRITE_DAC)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	return windows.SetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+}
+
 // grantDirWrite 保证目录的 DACL 上存在能力 SID 完全访问 ACE（继承到子对象）。
 // 幂等：已有该 SID 的完全访问允许 ACE 时跳过——既避免重复调用产生重复 ACE
 // （SetEntriesInAcl 不去重），也让目录被删重建后自动重新授权（无进程级缓存）。
 func grantDirWrite(dir string, sid *windows.SID) error {
-	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	sd, err := aclReadDACL(dir)
 	if err != nil {
 		return err
 	}
@@ -300,8 +353,7 @@ func grantDirWrite(dir string, sid *windows.SID) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION, nil, nil, newAcl, nil)
+	return aclWriteDACL(dir, newAcl)
 }
 
 // aclHasFullGrant 检查 ACL 是否已有指定 SID 的完全访问允许 ACE
@@ -593,7 +645,7 @@ func randomDenySID() (*windows.SID, error) {
 }
 
 // denyACLWorkers 是 deny ACE 校验/施加/撤销的并发度：目标可达上百个，逐个
-// Get/SetNamedSecurityInfo 数毫秒到十几毫秒（win 实测 79 目标一轮 ≈ 1.3s），
+// Get/SetSecurityInfo 数毫秒到十几毫秒（win 实测 79 目标一轮 ≈ 1.3s），
 // 这些对象彼此独立，并发跑互不相干。
 const denyACLWorkers = 8
 
@@ -867,7 +919,7 @@ func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf
 // 有该 ACE（含本次写入）。对象不可读 → (false, false, nil) 跳过（与
 // addDenyACE 的不可达口径一致）。
 func ensureDenyACE(path string, sid *windows.SID, restricted []*windows.SID) (added, present bool, err error) {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	sd, err := aclReadDACL(path)
 	if err != nil {
 		return false, false, nil
 	}
@@ -920,7 +972,7 @@ func aclHasDenyForSID(acl *windows.ACL, sid *windows.SID) bool {
 // ok=false 表示对象对受限令牌本就不可达（DACL 未向通用 restricted SID 授
 // 访问权）——跳过是语义等价的无操作；其余失败返回错误（fail-closed）。
 func addDenyACE(path string, denySid *windows.SID, restricted []*windows.SID) (bool, error) {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	sd, err := aclReadDACL(path)
 	if err != nil {
 		// 宿主无 READ_CONTROL：读/改该对象 DACL 均不可行；受限令牌同样拿不到
 		// 读授权（READ_CONTROL 普遍对所有用户开放），跳过等价无操作。
@@ -959,8 +1011,7 @@ func addDenyACE(path string, denySid *windows.SID, restricted []*windows.SID) (b
 	if err != nil {
 		return false, fmt.Errorf("sandbox: deny acl %s: %w", path, err)
 	}
-	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION, nil, nil, newAcl, nil); err != nil {
+	if err := aclWriteDACL(path, newAcl); err != nil {
 		if aclReachable(dacl, restricted) {
 			return false, fmt.Errorf("sandbox: deny %s: %w", path, err)
 		}
@@ -1030,7 +1081,7 @@ func removeAcesForSID(dacl *windows.ACL, sid *windows.SID) (*windows.ACL, bool, 
 // 字节级重建与 ACL 编辑器删除 ACE 同语义。返回错误供诊断/调用方处理
 // （撤销调用方仍为 best-effort 语义）。
 func revokeDenyACE(path string, denySid *windows.SID) error {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	sd, err := aclReadDACL(path)
 	if err != nil {
 		return err
 	}
@@ -1042,8 +1093,7 @@ func revokeDenyACE(path string, denySid *windows.SID) error {
 	if err != nil || !changed {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION, nil, nil, newAcl, nil)
+	return aclWriteDACL(path, newAcl)
 }
 
 // restrictedSIDsForReachability 汇总 restricting list 中的通用 SID

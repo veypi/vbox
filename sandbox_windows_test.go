@@ -785,3 +785,113 @@ func runConsoleModeMatrix(t *testing.T, logf func(string, ...any)) {
 	logf("powershell   exit=%d err=%v out=%q", code, werr, strings.TrimSpace(string(out)))
 	closeToken(uintptr(tok))
 }
+
+// 长路径（>MAX_PATH=260）ACL 回归：命名安全 API（Get/SetNamedSecurityInfo）
+// 在超长路径上失败，此前被「对象不可读 → 跳过」口径吞掉/直接报错——deny ACE
+// 与目录授权在深路径上静默不生效。本用例用句柄方式做独立断言（\\?\ + CreateFile
+// + GetSecurityInfo），覆盖 grantDirWrite / ensureDenyACE / revokeDenyACE 全链。
+func TestWindowsACELongPath(t *testing.T) {
+	base := t.TempDir()
+	dir := base
+	for len(dir) < 320 {
+		dir = filepath.Join(dir, "seg0123456789")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir deep fixture: %v", err)
+	}
+	t.Logf("fixture dir length=%d", len(dir))
+
+	openDACL := func(path string) *windows.ACL {
+		t.Helper()
+		p, err := windows.UTF16PtrFromString(`\\?\` + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := windows.CreateFile(p, windows.READ_CONTROL,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		if err != nil {
+			t.Fatalf("CreateFile on %d-char path: %v", len(path), err)
+		}
+		defer windows.CloseHandle(h)
+		sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatalf("GetSecurityInfo: %v", err)
+		}
+		dacl, _, err := sd.DACL()
+		if err != nil {
+			t.Fatalf("DACL: %v", err)
+		}
+		return dacl
+	}
+	denyCount := func(path string) int {
+		t.Helper()
+		dacl := openDACL(path)
+		if dacl == nil {
+			return 0
+		}
+		head := (*[8]byte)(unsafe.Pointer(dacl))
+		aclSize := int(binary.LittleEndian.Uint16(head[2:4]))
+		aceCount := int(binary.LittleEndian.Uint16(head[4:6]))
+		off, n := 8, 0
+		for i := 0; i < aceCount; i++ {
+			if off+8 > aclSize {
+				t.Fatalf("acl parse: ace header out of range")
+			}
+			ace := (*windows.ACE_HEADER)(unsafe.Pointer(uintptr(unsafe.Pointer(dacl)) + uintptr(off)))
+			if int(ace.AceSize) < 8 || off+int(ace.AceSize) > aclSize {
+				t.Fatalf("acl parse: ace size out of range")
+			}
+			if ace.AceType == windows.ACCESS_DENIED_ACE_TYPE {
+				n++
+			}
+			off += int(ace.AceSize)
+		}
+		return n
+	}
+
+	t.Run("grant-dir-write", func(t *testing.T) {
+		sid, err := capabilitySID("ws", dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := grantDirWrite(dir, sid); err != nil {
+			t.Fatalf("grantDirWrite on %d-char path: %v", len(dir), err)
+		}
+		ok, err := aclHasFullGrant(openDACL(dir), sid)
+		if err != nil || !ok {
+			t.Fatalf("full-grant ACE missing on long path: ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("deny-and-revoke", func(t *testing.T) {
+		f := filepath.Join(dir, "secret.key")
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sid, err := randomDenySID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := denyCount(f)
+		added, present, err := ensureDenyACE(f, sid, restrictedSIDsForReachability())
+		if err != nil {
+			t.Fatalf("ensureDenyACE on %d-char path: %v", len(f), err)
+		}
+		if !added || !present {
+			t.Fatalf("deny ACE not applied on long path: added=%v present=%v", added, present)
+		}
+		if got := denyCount(f); got != before+1 {
+			t.Fatalf("deny ACE count: before=%d after=%d", before, got)
+		}
+		if added2, present2, err := ensureDenyACE(f, sid, restrictedSIDsForReachability()); err != nil || added2 || !present2 {
+			t.Fatalf("ensure idempotence: added=%v present=%v err=%v", added2, present2, err)
+		}
+		if err := revokeDenyACE(f, sid); err != nil {
+			t.Fatalf("revokeDenyACE on long path: %v", err)
+		}
+		if got := denyCount(f); got != before {
+			t.Fatalf("deny ACE not revoked: before=%d after=%d", before, got)
+		}
+	})
+}
