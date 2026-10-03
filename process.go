@@ -102,7 +102,6 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 	}
 	defer m.untrack(h)
 
-	spawnStart := time.Now()
 	if err := cmd.Start(); err != nil {
 		closeToken(plan.token)
 		if plan.cleanup != nil {
@@ -126,10 +125,6 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 			return 0, fmt.Errorf("exec: assign job object: %v", err)
 		}
 	}
-	if confined && logf != nil {
-		logf("exec: spawn=%s", time.Since(spawnStart).Round(time.Millisecond))
-	}
-
 	if plan.cleanup != nil {
 		defer plan.cleanup()
 	}
