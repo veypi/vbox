@@ -82,8 +82,8 @@ type Rule struct {
 type FileOp uint8
 
 const (
-	OpRead FileOp = iota
-	OpWrite // 含创建/修改/删除/重命名/追加——unlink/rename 判定走 MatchNoFollow
+	OpRead  FileOp = iota
+	OpWrite        // 含创建/修改/删除/重命名/追加——unlink/rename 判定走 MatchNoFollow
 )
 
 // Decision 判定结果。
@@ -116,7 +116,7 @@ func NewFSRuleSet(rules []Rule, defaultWrite Effect) FSRuleSet {
 // Match 判定 canonical 化后的 path 上 op 是否放行（跟随末段符号链接——
 // open/connect 语义）。
 func (s FSRuleSet) Match(path string, op FileOp) Decision {
-	return s.match(Canonical(path), op)
+	return s.MatchPath(Canonical(path), op)
 }
 
 // MatchNoFollow 是 unlink/rename 语义的判定入口：末段符号链接不跟随（rm/mv
@@ -124,10 +124,11 @@ func (s FSRuleSet) Match(path string, op FileOp) Decision {
 // 走此入口——否则可写根内的外向链接会被无关目标路径的策略拒掉
 // （2026-09-22 实测 .venv 删除被阻的修复，迁移不得丢）。
 func (s FSRuleSet) MatchNoFollow(path string, op FileOp) Decision {
-	return s.match(CanonicalNoFollow(path), op)
+	return s.MatchPath(CanonicalNoFollow(path), op)
 }
 
-func (s FSRuleSet) match(cpath string, op FileOp) Decision {
+// MatchPath evaluates an already normalized path without consulting the host filesystem.
+func (s FSRuleSet) MatchPath(cpath string, op FileOp) Decision {
 	for i, r := range s.Rules {
 		if MatchPattern(r.Pattern, cpath) {
 			return Decision{Allow: effectAllows(r.Effect, op), Matched: i, Effect: r.Effect}
@@ -153,5 +154,5 @@ func effectAllows(e Effect, op FileOp) bool {
 
 // Resolve 返回路径的表判定（诊断/ explain 用）：命中行序号与效果。
 func (s FSRuleSet) Resolve(path string) Decision {
-	return s.match(Canonical(path), OpRead)
+	return s.MatchPath(Canonical(path), OpRead)
 }

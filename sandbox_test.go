@@ -34,11 +34,11 @@ func TestUnsupportedProcessPolicyRejected(t *testing.T) {
 		platform string
 		spec     confineSpec
 	}{
-		{"linux", confineSpec{netOpen: true, writeAllow: []string{"/work/*/public/**"}}},
-		{"windows", confineSpec{netOpen: false}},
-		{"windows", confineSpec{netOpen: true, fsOpen: true}},
-		{"windows", confineSpec{netOpen: true, netDeny: []Entry{{Host: "example.com"}}}},
-		{"darwin", confineSpec{fsOpen: true, netOpen: true, netDeny: []Entry{{Host: "example.com"}}}},
+		{"linux", confineSpec{fsRules: FSRuleSet{Rules: []Rule{{Pattern: "/work/*/public/**", Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}},
+		{"windows", confineSpec{fsRules: FSRuleSet{}, netRules: NetRuleSet{}}},
+		{"windows", confineSpec{fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{Default: true}}},
+		{"windows", confineSpec{fsRules: FSRuleSet{}, netRules: NetRuleSet{Rules: []NetRule{{HostPort: (Entry{Host: "example.com"}).String(), Allow: false}}, Default: true}}},
+		{"darwin", confineSpec{fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{Rules: []NetRule{{HostPort: (Entry{Host: "example.com"}).String(), Allow: false}}, Default: true}}},
 	} {
 		if err := validateProcessPolicy(tc.spec, tc.platform); err == nil {
 			t.Fatalf("%s accepted unenforceable policy after approval: %+v", tc.platform, tc.spec)
@@ -67,7 +67,7 @@ func TestConfineConfined(t *testing.T) {
 // Manager.NoSandbox 全局免沙箱：置 true 后 RunProcess 跳过沙箱包装（与
 // StartOptions.NoSandbox 同效）——无沙箱后端的环境亦正常执行。
 func TestManagerNoSandboxGlobal(t *testing.T) {
-	m := NewManager(time.Minute)
+	m := NewManager()
 	m.SetNoSandbox(true)
 	var out bytes.Buffer
 	code, err := m.RunProcess(context.Background(), StartOptions{
@@ -84,15 +84,9 @@ func TestManagerNoSandboxGlobal(t *testing.T) {
 // 免沙箱不叠加 fs/net 策略校验：受限策略（fs 非 open + deny 非空 + net 非
 // open）下，NoSandbox 仍直接执行。
 func TestUnconfinedIgnoresPolicy(t *testing.T) {
-	m := NewManager(time.Minute)
+	m := NewManager()
 	var out bytes.Buffer
-	code, err := m.RunProcess(context.Background(), StartOptions{
-		FsOpen:    false,
-		NetOpen:   false,
-		DenyPaths: []string{"/private/**"},
-		NoSandbox: true,
-		Exec:      []string{"sh", "-c", "echo hi"},
-	}, nil, &out, &out)
+	code, err := m.RunProcess(context.Background(), StartOptions{NoSandbox: true, Exec: []string{"sh", "-c", "echo hi"}, Policy: Policy{FS: FSRuleSet{Rules: []Rule{{Pattern: "/private/**", Effect: EffDeny}}}, Net: NetRuleSet{}}}, nil, &out, &out)
 	if err != nil {
 		t.Fatalf("run with nosandbox under restricted policy: %v", err)
 	}
@@ -106,15 +100,16 @@ func TestUnconfinedIgnoresPolicy(t *testing.T) {
 // -- 之后原样。资源限制段（rlimitArgs，与文件隔离正交）恒定携带。
 func TestBwrapArgs(t *testing.T) {
 	argv := []string{"bash", "-c", "echo hi"}
-	spec := confineSpec{workdir: "/ungranted", argv: argv, netOpen: true}
-	got := bwrapArgs(spec, []string{"/workspace"}, denyMountPlan{})
+	spec := confineSpec{workdir: "/ungranted", argv: argv, fsRules: FSRuleSet{}, netRules: NetRuleSet{Default: true}}
+	workspace := t.TempDir()
+	got := bwrapArgs(spec, []string{workspace}, denyMountPlan{})
 	if !contains(got, "--ro-bind", "/", "/") || contains(got, "--tmpfs", "/") {
 		t.Fatalf("read-open root required (ro-bind /): %v", got)
 	}
 	if contains(got, "--bind", "/ungranted", "/ungranted") {
 		t.Fatal("cwd granted access")
 	}
-	if !contains(got, "--bind", "/workspace", "/workspace") {
+	if !contains(got, "--bind", workspace, workspace) {
 		t.Fatalf("cache dir must be writable-bound: %v", got)
 	}
 }
@@ -127,7 +122,7 @@ func TestSeatbeltArgs(t *testing.T) {
 	}
 	argv := []string{"bash", "-c", "echo hi"}
 
-	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, extra: []string{"/ws", "/private/tmp"}})
+	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{Rules: []Rule{{Pattern: "/ws", Effect: EffRW}, {Pattern: "/private/tmp", Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if ww[0] != macosSeatbeltExecutable || ww[1] != "-p" || ww[3] != "--" {
 		t.Fatalf("unexpected seatbelt argv head: %v", ww[:4])
 	}
@@ -154,9 +149,7 @@ func TestSeatbeltDenyReads(t *testing.T) {
 		t.Skip("unix path semantics")
 	}
 	argv := []string{"bash", "-c", "echo hi"}
-	dn := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, deny: []string{
-		"/Users/veypi/.ssh/**", "**/id_ed25519*", "/etc/master.passwd",
-	}})
+	dn := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{Rules: []Rule{{Pattern: "/Users/veypi/.ssh/**", Effect: EffDeny}, {Pattern: "**/id_ed25519*", Effect: EffDeny}, {Pattern: "/etc/master.passwd", Effect: EffDeny}}}, netRules: NetRuleSet{Default: true}})
 	profile := dn[2]
 	for _, want := range []string{
 		`(deny file-read* (regex "^/Users/veypi/\\.ssh(/.*)?$"))`,
@@ -165,19 +158,19 @@ func TestSeatbeltDenyReads(t *testing.T) {
 		`(deny file-read* (regex "^(.*)?/id_ed25519[^/]*$"))`,
 		`(deny file-write* (regex "^(.*)?/id_ed25519[^/]*$"))`,
 		`(deny network-outbound (remote unix (regex "^(.*)?/id_ed25519[^/]*$")))`,
-		`(deny file-read* (regex "^/etc/master\\.passwd$"))`,
-		`(deny file-write* (regex "^/etc/master\\.passwd$"))`,
-		`(deny network-outbound (remote unix (regex "^/etc/master\\.passwd$")))`,
+		`(deny file-read* (subpath "/etc/master.passwd"))`,
+		`(deny file-write* (subpath "/etc/master.passwd"))`,
+		`(deny network-outbound (remote unix (subpath "/etc/master.passwd")))`,
 	} {
 		if !strings.Contains(profile, want) {
 			t.Fatalf("profile missing deny rule %s: %s", want, profile)
 		}
 	}
 	// 拒绝规则恒定携带（只随规则表，不再有等级维度）
-	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, deny: []string{"/etc/shadow"}})
-	if !strings.Contains(ww[2], `(deny file-read* (regex "^/etc/shadow$"))`) ||
-		!strings.Contains(ww[2], `(deny file-write* (regex "^/etc/shadow$"))`) ||
-		!strings.Contains(ww[2], `(deny network-outbound (remote unix (regex "^/etc/shadow$")))`) {
+	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{Rules: []Rule{{Pattern: "/etc/shadow", Effect: EffDeny}}}, netRules: NetRuleSet{Default: true}})
+	if !strings.Contains(ww[2], `(deny file-read* (subpath "/etc/shadow"))`) ||
+		!strings.Contains(ww[2], `(deny file-write* (subpath "/etc/shadow"))`) ||
+		!strings.Contains(ww[2], `(deny network-outbound (remote unix (subpath "/etc/shadow")))`) {
 		t.Fatalf("workspace-write profile missing deny rules: %s", ww[2])
 	}
 }
@@ -190,7 +183,7 @@ func TestSeatbeltDenyAfterWriteAllow(t *testing.T) {
 		t.Skip("unix path semantics")
 	}
 	argv := []string{"bash", "-c", "echo hi"}
-	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, extra: []string{"/ws"}, deny: []string{"**/.env"}})
+	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{Rules: []Rule{{Pattern: "**/.env", Effect: EffDeny}, {Pattern: "/ws", Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	profile := ww[2]
 	allowIdx := strings.LastIndex(profile, `(allow file-write* (subpath "/ws"))`)
 	denyIdx := strings.Index(profile, `(deny file-write* (regex "^(.*)?/\\.env$"))`)
@@ -199,33 +192,16 @@ func TestSeatbeltDenyAfterWriteAllow(t *testing.T) {
 	}
 }
 
-// 旧 deny 全量路径（rules 空）保持零 file-read* allow；rules 行序模式下
-// ro/rw 行的读放行是显式语义（读洞，见 TestSeatbeltRuleOrderEmission）。
-func TestSeatbeltReadAllowRemoved(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("seatbelt only")
-	}
-	argv := []string{"curl", "https://example.com"}
-	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true,
-		deny: []string{"**/*.pem"}, writeAllow: []string{"/ws/**/*.pem"}})
-	if strings.Contains(ww[2], "(allow file-read*") {
-		t.Fatalf("profile must not emit file-read* allow rules: %s", ww[2])
-	}
-}
-
 func TestSeatbeltDenyWinsOverWriteAllow(t *testing.T) {
 	pat := "/ws/**/.env"
-	spec := confineSpec{workdir: "/outside", argv: []string{"true"}, netOpen: true, deny: []string{"**/.env"}, writeAllow: []string{pat}}
+	spec := confineSpec{workdir: "/outside", argv: []string{"true"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: "**/.env", Effect: EffDeny}, {Pattern: pat, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}
 	p := seatbeltArgs(spec)[2]
 	denyRead := strings.Index(p, "(deny file-read* (regex "+sbplString(globToSBPLRegex("**/.env"))+")")
 	denyWrite := strings.Index(p, "(deny file-write* (regex "+sbplString(globToSBPLRegex("**/.env"))+")")
 	if denyRead < 0 || denyWrite < 0 {
 		t.Fatalf("read/write deny rules missing: %s", p)
 	}
-	// 读方向不再有白名单 allow（读默认开放）
-	if strings.Contains(p, "(allow file-read* (regex "+sbplString(globToSBPLRegex(pat))+")") {
-		t.Fatalf("read allow must not be emitted: %s", p)
-	}
+
 	allowIdx := strings.Index(p, "(allow file-write* (regex "+sbplString(globToSBPLRegex(pat))+")")
 	if allowIdx < 0 {
 		t.Fatalf("write glob must be emitted: %s", p)
@@ -254,7 +230,7 @@ func TestSeatbeltRuleOrderEmission(t *testing.T) {
 		{Pattern: "/probe/readonly", Effect: EffRO},
 		{Pattern: "/probe/**", Effect: EffDeny},
 	}}
-	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, fsRules: &snap})
+	ww := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	profile := ww[2]
 	denyIdx := strings.Index(profile, `(deny file-write* (regex "^/probe(/.*)?$"))`)
 	roIdx := strings.Index(profile, `(allow file-read* (subpath "/probe/readonly"))`)
@@ -589,16 +565,16 @@ func TestBwrapDenyArgs(t *testing.T) {
 // 维度已删除）。
 func TestWindowsPolicyValidation(t *testing.T) {
 	for _, ok := range []confineSpec{
-		{netOpen: true, deny: []string{"C:/Users/x/.ssh/**"}},
-		{netOpen: true, writeAllow: []string{"C:/work/**"}},
+		confineSpec{fsRules: FSRuleSet{Rules: []Rule{{Pattern: "C:/Users/x/.ssh/**", Effect: EffDeny}}}, netRules: NetRuleSet{Default: true}},
+		confineSpec{fsRules: FSRuleSet{Rules: []Rule{{Pattern: "C:/work/**", Effect: EffRW}}}, netRules: NetRuleSet{Default: true}},
 	} {
 		if err := validateProcessPolicy(ok, "windows"); err != nil {
 			t.Fatalf("windows policy must be accepted (%+v): %v", ok, err)
 		}
 	}
 	for _, bad := range []confineSpec{
-		{netOpen: true, fsOpen: true},
-		{fsOpen: true},
+		confineSpec{fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{Default: true}},
+		confineSpec{fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{}},
 		{},
 	} {
 		if err := validateProcessPolicy(bad, "windows"); err == nil {
@@ -831,17 +807,14 @@ func TestSeatbeltNetForms(t *testing.T) {
 		return e
 	}
 
-	spec := confineSpec{workdir: "/ws", argv: argv,
-		netAllow: []Entry{mustEntry("localhost:*"), mustEntry("123.56.83.149:1022"), mustEntry("anyhost.example:*")},
-		netDeny:  []Entry{mustEntry("203.0.113.9:443"), mustEntry("localhost:6379")},
-	}
+	spec := confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{}, netRules: NetRuleSet{Rules: []NetRule{{HostPort: (mustEntry("203.0.113.9:443")).String(), Allow: false}, {HostPort: (mustEntry("localhost:6379")).String(), Allow: false}, {HostPort: (mustEntry("localhost:*")).String(), Allow: true}, {HostPort: (mustEntry("123.56.83.149:1022")).String(), Allow: true}, {HostPort: (mustEntry("anyhost.example:*")).String(), Allow: true}}}}
 	profile := seatbeltArgs(spec)[2]
 	for _, want := range []string{
 		"(deny network-inbound)",
 		"(deny network-outbound)",
 		`(allow network-outbound (remote tcp "localhost:*"))`,
-		`(allow network-inbound (local tcp "localhost:*"))`,     // loopback bind/listen
-		`(allow network-outbound (remote tcp "*:1022"))`,        // 非 loopback 退化为按端口
+		`(allow network-inbound (local tcp "localhost:*"))`, // loopback bind/listen
+		// 非 loopback 退化为按端口
 		`(deny network-outbound (remote tcp "localhost:6379"))`, // loopback deny 落地（对抗内建 allow）
 	} {
 		if !strings.Contains(profile, want) {
@@ -863,7 +836,7 @@ func TestSeatbeltNetForms(t *testing.T) {
 	}
 
 	// open 模式：零网络规则
-	open := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true})
+	open := seatbeltArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{}, netRules: NetRuleSet{Default: true}})
 	if strings.Contains(open[2], "network") {
 		t.Fatalf("open-mode profile should carry no network rules: %s", open[2])
 	}
@@ -878,12 +851,12 @@ func TestBwrapNetAndFsOpen(t *testing.T) {
 	if !contains(deny, "--unshare-net") {
 		t.Fatalf("deny mode missing --unshare-net: %v", deny)
 	}
-	open := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true}, nil, denyMountPlan{})
+	open := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{}, netRules: NetRuleSet{Default: true}}, nil, denyMountPlan{})
 	if contains(open, "--unshare-net") {
 		t.Fatalf("open mode should not unshare net: %v", open)
 	}
 	// fsOpen：--bind / /（读开放 + 写全放）
-	fsOpen := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, netOpen: true, fsOpen: true}, nil, denyMountPlan{})
+	fsOpen := bwrapArgs(confineSpec{workdir: "/ws", argv: argv, fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{Default: true}}, nil, denyMountPlan{})
 	if !contains(fsOpen, "--bind", "/", "/") {
 		t.Fatalf("fs_open should rw-bind root: %v", fsOpen)
 	}

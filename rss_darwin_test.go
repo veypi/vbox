@@ -9,7 +9,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 // groupRSSKB 对**本进程实际进程组**返回非零 RSS（组内必有进程，物理内存
@@ -46,11 +45,9 @@ func TestRssLimitBytes(t *testing.T) {
 // 集成：正常进程（分配 ~200MB，远低于上限）经沙箱 RunProcess 不被 RSS 监控
 // 误杀，exit 0 且输出正确。嵌套沙箱环境（无后端 fail-closed）skip。
 func TestMonitorDoesNotKillNormalProcess(t *testing.T) {
-	m := NewManager(time.Minute)
+	m := NewManager()
 	var out bytes.Buffer
-	code, err := m.RunProcess(context.Background(), StartOptions{FsOpen: true, NetOpen: true,
-		Exec: []string{"python3", "-c", "import time; x=bytearray(200*1024*1024); time.sleep(0.2); print(len(x))"},
-	}, nil, &out, &out)
+	code, err := m.RunProcess(context.Background(), StartOptions{Exec: []string{"python3", "-c", "import time; x=bytearray(200*1024*1024); time.sleep(0.2); print(len(x))"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
 	if err != nil {
 		if strings.Contains(err.Error(), "no sandbox backend") {
 			t.Skipf("nested sandbox unavailable: %v", err)

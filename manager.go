@@ -10,7 +10,6 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var errClosed = errors.New("vbox: manager closed")
@@ -31,14 +30,9 @@ type Manager struct {
 	running   map[*procHandle]struct{}
 }
 
-func NewManager(timeout time.Duration) *Manager {
-	// timeout 参数仅为兼容调用方签名保留；运行期限由调用方 ctx 承担
-	// （exec 外层 30min 墙钟），本包不再自带任务计时。
+func NewManager() *Manager {
 	return &Manager{running: map[*procHandle]struct{}{}}
 }
-
-// SetExecTimeout 已废弃（运行期限由调用方 ctx 承担），保留空实现兼容调用方。
-func (m *Manager) SetExecTimeout(d time.Duration) {}
 
 func (m *Manager) SetNoSandbox(value bool) { m.noSandbox.Store(value) }
 

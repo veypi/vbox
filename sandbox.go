@@ -1,6 +1,5 @@
-// Native processes enforce the host execution policy independently of runtime
-// approval. Reads are open (deny always wins); writes are additive allow scopes,
-// and cwd grants no access. A backend that cannot enforce a rule rejects execution.
+// Native processes enforce an ordered file/network policy snapshot.
+// Cwd grants no access. Unsupported restrictions fail before execution.
 package vbox
 
 import (
@@ -47,11 +46,6 @@ const (
 // 三平台统一经规则表求值/落地，git 命令豁免（argv[0] basename 判据）同交 pod。
 // ro-bind 覆盖的 linux 有效性实测见 aic-pod 记录（2026-08-14，Debian 13）。
 
-// publicRoots 返回公共可写区（pod 侧 $HOME/.aic，经 PublicRootsFn 注入）：
-// workspace-write 白名单成员之一，与工作区/缓存/临时区并列——AI 跨会话保存产物
-// 与工具状态落盘（browser state save 等）共用；未注入返回 nil（白名单宁缺毋滥）。
-// 实现见 hooks.go。
-
 // sandboxBackend 是选中的平台后端。
 type sandboxBackend int
 
@@ -87,17 +81,39 @@ var (
 // confineSpec 是一次沙箱包装的完整输入（三域授权模型快照 + 等级/工作区/argv）。
 // 快照语义：每次 Start 读当次值（set_config/grant 动态生效），已启动进程不回溯。
 type confineSpec struct {
-	workdir    string               // 进程 cwd，不授予目录权限
-	extra      []string             // 追加可写根（nil = 仅基础白名单；fsRules 非空时 darwin 不消费）
-	argv       []string             // 被包装命令
-	deny       []string             // fs deny 预展开模式（fsauth.DenyPatterns 快照；fsRules 为空时使用）
-	fsRules    *FSRuleSet           // fs 域 vbox 快照（first-wins；darwin 逆序输出映射 SBPL 后规则胜，nil = 旧 deny 全量 fail-closed）
-	writeAllow []string             // 展开的可写 glob（裸路径由 extra 传入；fsRules 非空时 darwin 不消费）
-	fsOpen     bool                 // fs_policy=open：写除 deny 全放（darwin allow file-write* / bwrap 整机 rw）
-	netOpen    bool                 // net_policy=open：不加网络规则
-	netDeny    []Entry              // net_deny 快照（恒优先于 allow）
-	netAllow   []Entry              // net allow 快照（含内建 localhost:* 与 sid 临时 grant）
-	logf       func(string, ...any) // 沙箱阶段计时日志注入（nil = 静默；SetLogf → 生产注入）
+	workdir  string
+	argv     []string
+	fsRules  FSRuleSet
+	netRules NetRuleSet
+	logf     func(string, ...any)
+}
+
+func processSpec(opts StartOptions, logf func(string, ...any)) confineSpec {
+	return confineSpec{workdir: opts.Workdir, argv: opts.Exec, fsRules: opts.Policy.FS, netRules: opts.Policy.Net, logf: logf}
+}
+
+func (s confineSpec) denyPatterns() []string {
+	var out []string
+	for _, r := range s.fsRules.Rules {
+		if r.Effect == EffDeny {
+			out = append(out, r.Pattern)
+		}
+	}
+	return out
+}
+
+func (s confineSpec) writeRoots() []string {
+	var out []string
+	for _, r := range s.fsRules.Rules {
+		if r.Effect != EffRW {
+			continue
+		}
+		p := strings.TrimSuffix(r.Pattern, "/**")
+		if !strings.ContainsAny(p, "*?") {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Confine 将 argv 包装为沙箱执行形态（返回替换 argv；windows 的实际
@@ -108,7 +124,7 @@ type confineSpec struct {
 // deny/net 快照恒零值：现调用方仅测试；生产路径必须走 Start（StartOptions
 // 授权快照字段），否则 deny 隔离与网络管控静默缺失。
 func Confine(workdir string, argv []string) ([]string, error) {
-	plan, err := planConfined(confineSpec{workdir: workdir, argv: argv, netOpen: true})
+	plan, err := planConfined(confineSpec{workdir: workdir, argv: argv, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		return nil, err
 	}
@@ -179,12 +195,12 @@ func bwrapArgs(spec confineSpec, cacheDirs []string, deny denyMountPlan) []strin
 	// deny 覆盖挂载在末尾追加，恒优先。
 	args := []string{"bwrap"}
 	flag := "--ro-bind"
-	if spec.fsOpen {
+	if spec.fsRules.DefaultWrite == EffRW {
 		flag = "--bind"
 	}
 	args = append(args, flag, "/", "/")
 	args = append(args, "--dev", "/dev", "--proc", "/proc", "--die-with-parent")
-	if !spec.netOpen {
+	if !spec.netRules.Default {
 		// net_policy=deny：--unshare-net 全断（新 net ns 仅 loopback 且未配置——
 		// loopback 也不可用）。bwrap 无 per-destination 规则引擎，白名单粒度
 		// linux 不生效（近似层，net_allow 仅 darwin 落地；见 host_sandbox.md）。
@@ -193,9 +209,9 @@ func bwrapArgs(spec confineSpec, cacheDirs []string, deny denyMountPlan) []strin
 	args = append(args, rlimitArgs()...)
 	// 沙箱 profile 由 rules 派生（数字等级已删除）：临时区/缓存/可写根一律放行。
 	args = append(args, "--tmpfs", "/tmp")
-	for _, d := range append(append([]string{}, cacheDirs...), literalWriteRoots(spec.writeAllow)...) {
+	for _, d := range cacheDirs {
 		if d != "" {
-			args = append(args, "--bind", d, d)
+			args = append(args, bindIfExists(d, false)...)
 		}
 	}
 	// deny 隔离覆盖（§5.10）：后挂载优先（bwrap 后绑定覆盖前绑定），
@@ -342,7 +358,7 @@ func evaluateFSPolicy(targets []string, rules *FSRuleSet, writable []string, fsO
 // writableMountRoots 返回 linux 挂载层的可写根（bwrapArgs 实际 rw 绑定的
 // 路径 + /tmp tmpfs）——evaluateFSPolicy 据此判定哪些 ro 行需显式挂载收紧。
 func writableMountRoots(spec confineSpec) []string {
-	roots := append(append([]string{}, spec.extra...), literalWriteRoots(spec.writeAllow)...)
+	roots := spec.writeRoots()
 	return append(roots, "/tmp")
 }
 
@@ -697,12 +713,7 @@ func denyCoverAllCached(pats []string, logf func(string, ...any)) (targets []str
 // 若 /usr/bin/sandbox-exec 被篡改，攻击者已 root——codex 同策略）。
 const macosSeatbeltExecutable = "/usr/bin/sandbox-exec"
 
-// seatbeltArgs locks writes to the granted scopes (reads stay open) and emits
-// the fs rule table. SBPL 后规则胜（last matching rule wins；2026-09-23 探针
-// 复核）：fsRules（vbox first-wins 快照）非空时**逆序**逐行输出（表尾先行）
-// ——首命中语义与 SBPL 后命中等价（temp 行最后输出 = 内核最先生效；便利根最
-// 先输出，builtin/cfg deny 在其上，"便利不压 deny"保持）；空则退回旧口径
-// （deny 行全量 fail-closed，仅非生产直调路径使用）。
+// seatbeltArgs 将文件规则表逆序映射到 SBPL，保持 first-wins 语义。
 func seatbeltArgs(spec confineSpec) []string {
 	forms := []string{
 		"(version 1)",
@@ -710,21 +721,12 @@ func seatbeltArgs(spec confineSpec) []string {
 		"(deny file-write*)",
 		`(allow file-write* (literal "/dev/null"))`,
 	}
-	if spec.fsOpen {
+	if spec.fsRules.DefaultWrite == EffRW {
 		// fs_policy=open：写全放（表内 deny 行在后输出，继续生效）。
 		forms = append(forms, "(allow file-write*)")
-	} else if spec.fsRules == nil {
-		// legacy 直调路径：fsRules 非空时 extra/writeAllow 已编码在快照
-		// （便利根/cfg 行）内，不重复输出。
-		for _, root := range spec.extra {
-			forms = append(forms, "(allow file-write* (subpath "+sbplString(root)+"))")
-		}
-		for _, pat := range spec.writeAllow {
-			forms = append(forms, "(allow file-write* (regex "+sbplString(globToSBPLRegex(pat))+"))")
-		}
 	}
 	forms = append(forms, seatbeltNetForms(spec)...)
-	if spec.fsRules != nil {
+	{
 		// first-wins → SBPL 逆序输出。AF_UNIX connect 不走 file-* 判定（实测
 		// 2026-09-05）——deny/allow 行都带 network-outbound (remote unix) 形态，
 		// socket 覆盖与文件路径同口径（2026-09-23 探针复核）。写放行只看规则行。
@@ -756,16 +758,6 @@ func seatbeltArgs(spec confineSpec) []string {
 					"(allow file-write* "+filter+")")
 			}
 		}
-	} else {
-		for _, pat := range spec.deny {
-			if pat == "" {
-				continue
-			}
-			re := sbplString(globToSBPLRegex(pat))
-			forms = append(forms, "(deny file-read* (regex "+re+"))")
-			forms = append(forms, "(deny file-write* (regex "+re+"))")
-			forms = append(forms, "(deny network-outbound (remote unix (regex "+re+")))")
-		}
 	}
 	return append([]string{macosSeatbeltExecutable, "-p", stringsJoin(forms), "--"}, spec.argv...)
 }
@@ -779,77 +771,48 @@ func sbplFilter(pat string) string {
 	return "(subpath " + sbplString(pat) + ")"
 }
 
-// seatbeltNetForms 生成网络管控段（net_policy=deny 锁定模式时；open 模式零规则，
-// allow default 兜底）：
-//
-//	(deny network-inbound)(deny network-outbound) 打底
-//	→ net_allow 逐条放行（2026-09-07 实测：seatbelt 网络过滤器 host 只支持
-//	  */localhost——按目标 IP/域名的内核级放行不存在；loopback 条目发
-//	  localhost 两形态（remote tcp 连通 + local tcp inbound bind/listen）；
-//	  非 loopback 条目退化为 *:port 按端口粗放行；port=* 不可表达跳过——
-//	  精细 host:port 判定由 curl 虚拟指令工具层承担（shellCurlFetcher 前置
-//	  netauth.Allowed 闸 + --resolve 钉住，见 fetcher.go））
-//	→ net_deny 逐条 deny（恒优先——过滤规则与兜底 deny 共存实测互不干扰）；
-//	  仅 loopback 条目落地（对抗内建 localhost:* allow）；非 loopback deny
-//	  不输出（基线全拒已覆盖，host 粒度内核不可表达，工具层 curl 闸精判
-//	  兜底——避免 *:port 株连同端口 allow 目标，见 seatbeltEntryForms）
-//
-// 实测纪律（2026-09-07 探针）：
-//   - `(allow network-outbound (local tcp "localhost:*"))` 是毒形态——其语义
-//     覆盖一切出站连接（本地端恒命中），等于拆掉整个 deny outbound，严禁输出；
-//   - `(remote unix ...)` 必须 regex 形态（裸字符串参数非法）；
-//   - deny network* 下系统 DNS（mDNSResponder/dnssd mach+XPC+unix socket
-//     组合）实测多轮放行均不生效——锁定模式等于无沙箱内 DNS，FQDN 目标由
-//     工具层 pod 侧解析 + curl --resolve 钉住补偿；
-//   - 规则顺序对本段不重要（过滤规则与兜底 deny 各测其序），但 deny 表（文件/
-//     unix socket）仍在本段之后输出（旧教训不回收）。
+// seatbeltNetForms 先消除被前序规则覆盖的端口，再输出 Seatbelt 规则。
+// Seatbelt 网络过滤器的具体端口优先于通配端口，不能仅靠逆序输出实现 first-wins。
+// 本后端仅能区分 loopback 端口；其他目标在启动前校验中拒绝。
 func seatbeltNetForms(spec confineSpec) []string {
-	if spec.netOpen {
-		var forms []string
-		for _, e := range spec.netDeny {
-			forms = append(forms, seatbeltEntryForms(e, "deny")...)
+	var forms []string
+	if !spec.netRules.Default {
+		forms = append(forms, "(deny network-inbound)", "(deny network-outbound)")
+	}
+	seen := map[string]bool{}
+	var effective []NetRule
+	for _, r := range spec.netRules.Rules {
+		e, err := ParseEntry(r.HostPort)
+		if err != nil || !isLoopbackHost(e.Host) || seen[e.Port] {
+			continue
 		}
-		return forms
+		seen[e.Port] = true
+		effective = append(effective, r)
+		if e.Port == "*" {
+			break
+		}
 	}
-	forms := []string{
-		"(deny network-inbound)",
-		"(deny network-outbound)",
-	}
-	for _, e := range spec.netAllow {
-		forms = append(forms, seatbeltEntryForms(e, "allow")...)
-	}
-	for _, e := range spec.netDeny {
-		forms = append(forms, seatbeltEntryForms(e, "deny")...)
+	for i := len(effective) - 1; i >= 0; i-- {
+		r := effective[i]
+		e, _ := ParseEntry(r.HostPort)
+		verb := "deny"
+		if r.Allow {
+			verb = "allow"
+		}
+		forms = append(forms, seatbeltEntryForms(e, verb)...)
 	}
 	return forms
 }
 
-// seatbeltEntryForms 把一条 netauth 条目实例化为 SBPL 规则（粒度限制与实测
-// 纪律见 seatbeltNetForms 注释）：
-//   - loopback（localhost/127.0.0.1/::1）：allow 发 remote tcp（连通）+
-//     local tcp inbound（bind/listen，本机服务场景）两形态；deny 仅 remote tcp
-//     （对抗内建 localhost:* allow，localhost 内核可精判）；
-//   - 非 loopback allow：退化为 *:port（host 必须为 */localhost，按端口放行）；
-//     port=* 内核不可表达，跳过（工具层 curl 闸仍按 host:port 精判）；
-//   - 非 loopback deny：不输出内核规则——锁定模式基线本就是全拒，此类规则
-//     唯一作用是对抗同端口 allow 的 *:port 粗放行，但内核无 host 粒度必然
-//     株连同端口的 allow 目标（显式放行被无关 deny 打死，2026-09-07 评审）；
-//     精细 host 判定由工具层 curl 闸承担，不假装内核能表达。
 func seatbeltEntryForms(e Entry, verb string) []string {
-	if isLoopbackHost(e.Host) {
-		addr := sbplString("localhost:" + e.Port)
-		if verb == "deny" {
-			return []string{"(deny network-outbound (remote tcp " + addr + "))"}
-		}
-		return []string{
-			"(allow network-outbound (remote tcp " + addr + "))",
-			"(allow network-inbound (local tcp " + addr + "))",
-		}
-	}
-	if verb == "deny" || e.Port == "*" {
+	if !isLoopbackHost(e.Host) {
 		return nil
 	}
-	return []string{"(allow network-outbound (remote tcp " + sbplString("*:"+e.Port) + "))"}
+	addr := sbplString("localhost:" + e.Port)
+	return []string{
+		"(" + verb + " network-outbound (remote tcp " + addr + "))",
+		"(" + verb + " network-inbound (local tcp " + addr + "))",
+	}
 }
 
 // isLoopbackHost 判定 loopback 条目（localhost 字面或 IPv4/IPv6 loopback）。
@@ -950,74 +913,52 @@ func regexEscape(c byte) string {
 	return string(rune(c))
 }
 
-// mergeEnv 把附加环境并入继承环境：同名键以附加值为准（替换而非追加——
-// Windows CreateProcess 对重复变量名取首个，必须过滤；unix 平台 plan.env
-// 恒 nil，本函数仅 windows 受限令牌的 TMP/TEMP 注入使用）。
-func mergeEnv(extra []string) []string {
-	if len(extra) == 0 {
-		return nil
-	}
-	drop := map[string]bool{}
-	for _, kv := range extra {
-		if i := strings.IndexByte(kv, '='); i > 0 {
-			drop[kv[:i]] = true
-		}
-	}
-	base := os.Environ()
-	env := make([]string, 0, len(base)+len(extra))
-	for _, kv := range base {
-		if i := strings.IndexByte(kv, '='); i > 0 && drop[kv[:i]] {
-			continue
-		}
-		env = append(env, kv)
-	}
-	return append(env, extra...)
-}
-
 // validateProcessPolicy fails before execution when a backend cannot enforce the
 // requested scope. Never approximate host rules by opening all hosts or paths.
 func validateProcessPolicy(spec confineSpec, platform string) error {
-	fail := func(why string) error {
-		return &DeniedError{Reason: "sandbox cannot enforce host policy: " + why}
-	}
-	if platform == "windows" {
-		// 受限令牌 + ACL 模型：写白名单（fs_policy=deny）与 deny ACE 均可落地；
-		// 写全放（fs_policy=open 写级）与网络规则无法表达 → 拒绝执行。
-		if spec.fsOpen {
-			return fail("this Windows backend cannot enforce fs_policy=open writable-everything")
-		}
-		if !spec.netOpen || len(spec.netDeny) > 0 {
-			return fail("this Windows backend does not implement network rules")
+	fail := func(why string) error { return &DeniedError{Reason: "sandbox cannot enforce host policy: " + why} }
+	for _, r := range spec.fsRules.Rules {
+		if r.Pattern == "" || r.Effect > EffRW {
+			return fail("invalid file rule")
 		}
 	}
-	for _, e := range spec.netDeny {
-		if platform != "darwin" || !isLoopbackHost(e.Host) {
-			return fail("selective network deny is unsupported by this backend")
-		}
+	if spec.fsRules.DefaultWrite != EffDeny && spec.fsRules.DefaultWrite != EffRW {
+		return fail("invalid default file permission")
 	}
-	if !spec.netOpen {
-		for _, e := range spec.netAllow {
-			if platform != "darwin" || !isLoopbackHost(e.Host) {
-				return fail("selective network allow is unsupported by this backend")
+	if platform == "windows" && spec.fsRules.DefaultWrite == EffRW {
+		return fail("this Windows backend cannot enforce fs_policy=open writable-everything")
+	}
+	if platform == "windows" && !spec.netRules.Default {
+		return fail("this Windows backend does not implement network rules")
+	}
+	for _, r := range spec.netRules.Rules {
+		e, err := ParseEntry(r.HostPort)
+		if err != nil {
+			return fail(err.Error())
+		}
+		// 全开放时 allow 不收紧权限，无需平台表达；deny 和锁定模式中的 allow 必须落实。
+		if r.Allow && spec.netRules.Default {
+			hasDeny := false
+			for _, other := range spec.netRules.Rules {
+				if !other.Allow {
+					hasDeny = true
+					break
+				}
 			}
+			if !hasDeny {
+				continue
+			}
+		}
+		if platform != "darwin" || !isLoopbackHost(e.Host) {
+			return fail("selective network rule is unsupported by this backend")
 		}
 	}
 	if platform == "linux" {
-		// 写 glob 需可实例化为 bind 目标；deny 的形态可实例化性由
-		// denyCoverAll（planConfined 内）判定——不可实例化即拒绝执行。
-		for _, p := range spec.writeAllow {
-			if strings.ContainsAny(strings.TrimSuffix(p, "/**"), "*?") {
-				return fail("Linux mount confinement cannot enforce this path glob: " + p)
+		for _, r := range spec.fsRules.Rules {
+			if r.Effect == EffRW && strings.ContainsAny(strings.TrimSuffix(r.Pattern, "/**"), "*?") {
+				return fail("Linux mount confinement cannot enforce this path glob: " + r.Pattern)
 			}
 		}
 	}
 	return nil
-}
-
-func literalWriteRoots(patterns []string) []string {
-	roots := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		roots = append(roots, strings.TrimSuffix(p, "/**"))
-	}
-	return roots
 }

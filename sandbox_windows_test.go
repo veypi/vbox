@@ -168,7 +168,7 @@ func TestWindowsCreateRestrictedTokenFlagMatrix(t *testing.T) {
 func TestWindowsSandboxReadOnlyDeniesWrite(t *testing.T) {
 	ws := t.TempDir()
 	target := filepath.Join(ws, "ro.txt")
-	plan, err := planConfined(confineSpec{netOpen: true, workdir: ws, argv: writeCmd(target)})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(target), fsRules: FSRuleSet{}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestWindowsSandboxReadOnlyDeniesWrite(t *testing.T) {
 
 // 不可表达的策略仍拒绝：写全放（fs_policy=open）与网络管控。
 func TestWindowsSandboxRejectsUnsupportedPolicy(t *testing.T) {
-	if _, err := planConfined(confineSpec{workdir: t.TempDir(), argv: []string{"cmd", "/c", "echo ok"}, netOpen: true, fsOpen: true}); err == nil || !strings.Contains(err.Error(), "cannot enforce") {
+	if _, err := planConfined(confineSpec{workdir: t.TempDir(), argv: []string{"cmd", "/c", "echo ok"}, fsRules: FSRuleSet{DefaultWrite: EffRW}, netRules: NetRuleSet{Default: true}}); err == nil || !strings.Contains(err.Error(), "cannot enforce") {
 		t.Fatalf("fs_policy=open write must reject: %v", err)
 	}
 	if _, err := planConfined(confineSpec{workdir: t.TempDir(), argv: []string{"cmd", "/c", "echo ok"}}); err == nil || !strings.Contains(err.Error(), "cannot enforce") {
@@ -194,7 +194,7 @@ func TestWindowsSandboxRejectsUnsupportedPolicy(t *testing.T) {
 // TMP/TEMP 注入：受限进程看到的是私有临时目录。
 func TestWindowsSandboxTempEnv(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{netOpen: true, workdir: ws, extra: []string{ws}, argv: []string{"cmd", "/c", "echo TMP=[%TMP%]"}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo TMP=[%TMP%]"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestWindowsSandboxTempEnv(t *testing.T) {
 // cleanup：进程结束后私有临时目录被删除。
 func TestWindowsSandboxCleanupRemovesTemp(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{netOpen: true, workdir: ws, extra: []string{ws}, argv: []string{"cmd", "/c", "echo %TMP%"}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo %TMP%"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	before := aclDenyAceCount(t, secret)
 
 	// 写 deny：白名单内可写路径上的 deny 文件写也必须失败且内容不变
-	plan, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{secret}, netOpen: true, argv: writeCmd(secret)})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 		t.Fatalf("deny ACE must persist after run: before=%d after=%d", before, got)
 	}
 	// 幂等：再次 plan 同一目标不重复打 ACE（状态对账命中，零 ACL 写）
-	if _, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{secret}, netOpen: true, argv: writeCmd(secret)}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined (again): %v", err)
 	}
 	if got := aclDenyAceCount(t, secret); got != before+1 {
@@ -339,7 +339,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	// 若未来引入读侧隔离机制，此断言需随之更新）。
 	// 用相对路径：os/exec 会把 argv 内嵌引号转义成 \"，cmd 解析后报"文件名…
 	// 语法不正确"；cmd cwd 即 ws，相对路径避开引号。
-	plan2, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{secret}, netOpen: true, argv: []string{"cmd", "/c", "type secret.key"}})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type secret.key"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 
 	// 非 deny 路径：白名单内写正常
 	open := filepath.Join(ws, "open.txt")
-	plan3, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{secret}, netOpen: true, argv: writeCmd(open)})
+	plan3, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(open), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -385,13 +385,13 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 	if err := os.WriteFile(head, []byte(headContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	row, ok := CompileFSRule("ro:"+gitDir, ClassBuiltin)
-	if !ok {
+	rows, err := CompileFSRules([]string{"ro:" + gitDir}, ClassBuiltin)
+	if err != nil {
 		t.Fatalf("compile ro rule failed: %s", gitDir)
 	}
-	rules := FSRuleSet{Rules: []Rule{row}}
+	rules := FSRuleSet{Rules: rows}
 
-	plan, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: writeCmd(head)})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(head), fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 	}
 	// 兄弟路径可写（ro 只收紧目标子树）。
 	okFile := filepath.Join(ws, "ok.txt")
-	plan2, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: writeCmd(okFile)})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(okFile), fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 		t.Fatalf("sibling write should succeed: %s", out2)
 	}
 	// 读放行。
-	plan3, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, fsRules: &rules, netOpen: true, argv: []string{"cmd", "/c", "type .git\\HEAD"}})
+	plan3, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type .git\\HEAD"}, fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestWindowsDenyStaleRevocation(t *testing.T) {
 	}
 	beforeA := aclDenyAceCount(t, a)
 
-	if _, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{a}, netOpen: true, argv: writeCmd(a)}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(a), fsRules: FSRuleSet{Rules: []Rule{{Pattern: a, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined(a): %v", err)
 	}
 	if got := aclDenyAceCount(t, a); got != beforeA+1 {
@@ -457,7 +457,7 @@ func TestWindowsDenyStaleRevocation(t *testing.T) {
 	}
 
 	// 目标集变化（a → b）：a 的 ACE 应被对账撤销，b 打上
-	if _, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, deny: []string{b}, netOpen: true, argv: writeCmd(b)}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(b), fsRules: FSRuleSet{Rules: []Rule{{Pattern: b, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined(b): %v", err)
 	}
 	if got := aclDenyAceCount(t, a); got != beforeA {
@@ -476,7 +476,7 @@ func TestWindowsSandboxWriteConfinement(t *testing.T) {
 	inFile := filepath.Join(ws, "in.txt")
 	outFile := filepath.Join(outside, "out.txt")
 
-	plan, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, netOpen: true, argv: writeCmd(inFile)})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(inFile), fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestWindowsSandboxWriteConfinement(t *testing.T) {
 		t.Fatalf("granted workspace write did not materialize: %v", err)
 	}
 
-	plan2, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, netOpen: true, argv: writeCmd(outFile)})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(outFile), fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestWindowsJobLimits(t *testing.T) {
 
 	// planConfined 集成：job 句柄随 plan 返回，子进程 assign 后正常执行
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{netOpen: true, workdir: ws, extra: []string{ws}, argv: []string{"cmd", "/c", "echo ok"}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo ok"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestWindowsConsoleModeDetachedStage(t *testing.T) {
 // 的实际状态（定位“授权目录内写仍被拒”的成因）。
 func TestWindowsGrantDiag(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{workdir: ws, extra: []string{ws}, netOpen: true, argv: []string{"cmd", "/c", "exit /b 0"}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "exit /b 0"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}

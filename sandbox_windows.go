@@ -436,8 +436,8 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	}
 	// 路径形态边界（2026-09-24 /c/ 规范形全局统一）：策略层路径（deny/extra/
 	// workdir 可能带 /c/ 规范形）一律转原生态——本文件后续全按 OS 路径消费。
-	spec.deny = pathsToOS(spec.deny)
-	spec.extra = pathsToOS(spec.extra)
+	deny := pathsToOS(spec.denyPatterns())
+	writable := pathsToOS(spec.writeRoots())
 	if spec.workdir != "" {
 		spec.workdir = pathToOS(spec.workdir)
 	}
@@ -453,7 +453,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	var tmpDir string
 	var grantD, tmpD time.Duration
 	// fs deny：稳定 SID + 持久拒绝 ACE（幂等 ensure；不按进程撤销）
-	denySid, err := ensureDenyACEs(spec.deny, spec.fsRules, spec.extra, logf)
+	denySid, err := ensureDenyACEs(deny, &spec.fsRules, writable, logf)
 	if err != nil {
 		return launchPlan{}, err
 	}
@@ -465,13 +465,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 
 	// 可写区授权（workspace-write profile 由 rules 派生，数字等级已删除）。
 	{
-		dirs := make([]string, 0, 4)
-		if spec.workdir != "" {
-			dirs = append(dirs, spec.workdir)
-		}
-		dirs = append(dirs, cacheRoots()...)
-		dirs = append(dirs, publicRoots()...)
-		dirs = append(dirs, spec.extra...)
+		dirs := existingDirs(writable...)
 		for _, d := range dirs {
 			sid, err := capabilitySID("ws", d)
 			if err != nil {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -25,14 +25,12 @@ func (m *Manager) Spawn(ctx context.Context, opts StartOptions) (*Spawned, error
 	plan := launchPlan{}
 	execArgv := opts.Exec
 	confined := !opts.NoSandbox && !m.noSandbox.Load()
+	if confined && opts.Argv0 != nil && runtime.GOOS != "windows" {
+		return nil, fmt.Errorf("exec: custom argv0 is not supported by this sandbox launcher")
+	}
 	if confined {
 		var err error
-		plan, err = planConfined(confineSpec{
-			workdir: opts.Workdir, extra: opts.WriteRoots, argv: opts.Exec,
-			deny: opts.DenyPaths, fsOpen: opts.FsOpen,
-			writeAllow: opts.WritePaths,
-			netOpen:    opts.NetOpen, netDeny: opts.NetDeny, netAllow: opts.NetAllow,
-		})
+		plan, err = planConfined(processSpec(opts, m.logFunc()))
 		if err != nil {
 			return nil, err
 		}
@@ -40,15 +38,15 @@ func (m *Manager) Spawn(ctx context.Context, opts StartOptions) (*Spawned, error
 	}
 
 	cmd := exec.CommandContext(ctx, execArgv[0], execArgv[1:]...)
-	cmd.Dir = opts.Workdir
-	cmd.Env = mergeEnv(plan.env)
-	if confined {
-		// env 清洗：与 Start 同语义（沙箱进程剥离敏感变量；nosandbox 不清洗）。
-		if cmd.Env == nil {
-			cmd.Env = os.Environ()
-		}
-		cmd.Env = ScrubEnv(cmd.Env)
+	if opts.Argv0 != nil {
+		cmd.Args[0] = *opts.Argv0
 	}
+	cmd.Dir = opts.Workdir
+	inherited := cmd.Environ()
+	if opts.ReplaceEnv {
+		inherited = []string{}
+	}
+	cmd.Env = processEnv(inherited, plan.env, opts.Env, confined)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("exec: stdout pipe: %v", err)

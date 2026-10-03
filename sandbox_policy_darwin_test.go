@@ -1,8 +1,12 @@
 package vbox
 
 import (
+	"context"
+	"net"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // darwin seatbelt 的 vbox 快照消费（W2b，2026-09-29）：first-wins 快照逆序
@@ -27,9 +31,7 @@ func TestSeatbeltFSRulesReversedEmission(t *testing.T) {
 		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
 		{Pattern: "/Users/v/aic", Effect: EffRW, Class: ClassConvenience},
 	}, DefaultWrite: EffDeny}
-	profile := seatbeltProfile(confineSpec{
-		argv: []string{"/bin/echo", "hi"}, fsRules: &snap, netOpen: true,
-	})
+	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo", "hi"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	idx := func(sub string) int { return strings.Index(profile, sub) }
 	// 逆序：便利根（表尾）最先输出，temp（表头）最后输出。
 	iConv := idx(`(allow file-write* (subpath "/Users/v/aic"))`)
@@ -52,9 +54,7 @@ func TestSeatbeltFSRulesHoleSemantics(t *testing.T) {
 		{Pattern: "/Users/v/.ssh/known_hosts", Effect: EffRO, Class: ClassCfg},
 		{Pattern: "/Users/v/.ssh/**", Effect: EffDeny, Class: ClassCfg},
 	}, DefaultWrite: EffDeny}
-	profile := seatbeltProfile(confineSpec{
-		argv: []string{"/bin/echo"}, fsRules: &snap, netOpen: true,
-	})
+	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	iRo := strings.Index(profile, `(allow file-read* (subpath "/Users/v/.ssh/known_hosts"))`)
 	iDeny := strings.Index(profile, `(deny file-read* (regex "^/Users/v/\\.ssh(/.*)?$"))`)
 	if iRo < 0 || iDeny < 0 {
@@ -72,30 +72,45 @@ func TestSeatbeltFSRulesHoleSemantics(t *testing.T) {
 	}
 }
 
-func TestSeatbeltFSRulesSkipsLegacyBase(t *testing.T) {
-	t.Parallel()
-	// fsRules 非空时 legacy extra/writeAllow 不重复输出（已编码在快照行内）。
-	snap := FSRuleSet{Rules: []Rule{
-		{Pattern: "/Users/v/aic", Effect: EffRW, Class: ClassConvenience},
-	}, DefaultWrite: EffDeny}
-	profile := seatbeltProfile(confineSpec{
-		argv: []string{"/bin/echo"}, fsRules: &snap, netOpen: true,
-		extra: []string{"/legacy/extra"}, writeAllow: []string{"/legacy/glob/**"},
-	})
-	if strings.Contains(profile, "/legacy/extra") || strings.Contains(profile, "legacy/glob") {
-		t.Fatalf("fsRules 非空时 legacy base 不得输出：\n%s", profile)
-	}
+func TestSeatbeltOpenWithDeny(t *testing.T) {
 	// fsOpen 与快照行共存：open 打底写全放，deny 行仍生效。
 	snapOpen := FSRuleSet{Rules: []Rule{
 		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
 	}, DefaultWrite: EffRW}
-	profile = seatbeltProfile(confineSpec{
-		argv: []string{"/bin/echo"}, fsRules: &snapOpen, fsOpen: true, netOpen: true,
-	})
+	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo"}, fsRules: snapOpen, netRules: NetRuleSet{Default: true}})
 	if !strings.Contains(profile, "(allow file-write*)") {
 		t.Fatalf("fsOpen 缺打底放行：\n%s", profile)
 	}
 	if !strings.Contains(profile, "(deny file-write*") {
 		t.Fatalf("fsOpen 下 deny 行仍须生效：\n%s", profile)
+	}
+}
+
+func TestSeatbeltNetworkRulePriority(t *testing.T) {
+	nc, err := exec.LookPath("nc")
+	if err != nil {
+		t.Skip("nc unavailable")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	allow := NetRule{HostPort: "localhost:" + port, Allow: true}
+	deny := NetRule{HostPort: "localhost:*"}
+	for _, tc := range []struct {
+		rules []NetRule
+		allow bool
+	}{{[]NetRule{allow, deny}, true}, {[]NetRule{deny, allow}, false}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		code, err := NewManager().RunProcess(ctx, StartOptions{Exec: []string{nc, "-z", "-G", "1", "127.0.0.1", port}, Policy: Policy{Net: NetRuleSet{Rules: tc.rules}}}, nil, nil, nil)
+		cancel()
+		if err != nil && strings.Contains(err.Error(), "no sandbox backend") {
+			t.Skip(err)
+		}
+		if err != nil || (code == 0) != tc.allow {
+			t.Fatalf("rules=%+v: exit=%d err=%v, want allowed=%v", tc.rules, code, err, tc.allow)
+		}
 	}
 }

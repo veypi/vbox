@@ -5,7 +5,7 @@ import "testing"
 func TestParseEntry(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		in       string
+		in         string
 		host, port string
 	}{
 		{"example.com", "example.com", "*"},
@@ -106,9 +106,9 @@ func TestScrubEnv(t *testing.T) {
 		"AWS_SECRET_ACCESS_KEY=xyz",
 		"GPG_PASSPHRASE=p",
 		"PASSWORD=hunter2",
-		"MONKEY=keep",   // 含 KEY 子串但非整词
-		"TURKEY=keep",   // 同上
-		"APIKEY=keep",   // 已知残余缺口：无边界连写不剥离（保守优于漏放的反向——文档化）
+		"MONKEY=keep", // 含 KEY 子串但非整词
+		"TURKEY=keep", // 同上
+		"APIKEY=keep", // 已知残余缺口：无边界连写不剥离（保守优于漏放的反向——文档化）
 		"MY_CREDENTIALS=x",
 	}
 	out := ScrubEnv(env)
@@ -138,19 +138,13 @@ func cutEq(s string) (string, string, bool) {
 	return s, "", false
 }
 
-func TestCompileSkeleton(t *testing.T) {
-	t.Parallel()
-	if _, err := Compile(Policy{
-		FS:  FSRuleSet{Rules: []Rule{{Pattern: "/a", Effect: EffRW}}, DefaultWrite: EffDeny},
-		Net: NetRuleSet{Rules: []NetRule{{HostPort: "example.com:443", Allow: true}}},
-	}); err != nil {
-		t.Fatalf("Compile err = %v", err)
-	}
-	// 坏规则行编译期拒绝。
-	if _, err := Compile(Policy{Net: NetRuleSet{Rules: []NetRule{{HostPort: "bad host"}}}}); err == nil {
-		t.Fatalf("Compile 应拒绝非法 net 行")
-	}
-	if _, err := Compile(Policy{FS: FSRuleSet{Rules: []Rule{{Pattern: ""}}}}); err == nil {
-		t.Fatalf("Compile 应拒绝空 fs 模式")
+func TestInvalidPolicyRejectedAtLaunch(t *testing.T) {
+	for _, pol := range []Policy{
+		{Net: NetRuleSet{Rules: []NetRule{{HostPort: "bad host"}}}},
+		{FS: FSRuleSet{Rules: []Rule{{Pattern: ""}}}},
+	} {
+		if err := validateProcessPolicy(processSpec(StartOptions{Policy: pol}, nil), "darwin"); err == nil {
+			t.Fatal("invalid policy accepted")
+		}
 	}
 }

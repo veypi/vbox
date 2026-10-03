@@ -135,21 +135,24 @@ type NetRuleSet struct {
 // Match 判定目标是否放行（first-wins）。目标非法（解析失败）→ false（fail-closed）；
 // 规则行解析失败跳过（编译期/入表校验应已拦截，运行时宁缺毋滥）。
 // 端口匹配取保守交集语义：规则为 * 或相等即命中；查询为 * 时重叠即命中。
-func (s NetRuleSet) Match(hostport string) bool {
+func (s NetRuleSet) Match(hostport string) bool { allow, _ := s.Resolve(hostport); return allow }
+
+// Resolve reports the first matching row, or -1 for the default/invalid target.
+func (s NetRuleSet) Resolve(hostport string) (allow bool, matched int) {
 	q, err := ParseEntry(hostport)
 	if err != nil {
-		return false
+		return false, -1
 	}
-	for _, r := range s.Rules {
-		re, err := ParseEntry(r.HostPort)
+	for i, row := range s.Rules {
+		target, err := ParseEntry(row.HostPort)
 		if err != nil {
-			continue
+			return false, i
 		}
-		if EntryMatch(re, q) {
-			return r.Allow
+		if EntryMatch(target, q) {
+			return row.Allow, i
 		}
 	}
-	return s.Default
+	return s.Default, -1
 }
 
 // EntryMatch 判定规则条目 r 是否覆盖查询条目 q：host 字符串相等（双方已归一）

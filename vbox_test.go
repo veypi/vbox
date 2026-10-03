@@ -181,11 +181,12 @@ func TestParseFSRuleGuards(t *testing.T) {
 
 func TestCompileFSRuleCanonical(t *testing.T) {
 	t.Parallel()
-	r, ok := CompileFSRule("rw:/var/tmp/x/**", ClassCfg)
-	if !ok {
+	rows, err := CompileFSRules([]string{"rw:/var/tmp/x/**"}, ClassCfg)
+	if err != nil {
 		t.Fatalf("CompileFSRule 失败")
 	}
 	// macOS /var → /private/var 字面前缀展开（linux 上相同则相等，断言语义不限平台）。
+	r := rows[0]
 	want := CanonicalPattern("/var/tmp/x/**")
 	if r.Pattern != want {
 		t.Fatalf("Pattern = %q, want %q", r.Pattern, want)

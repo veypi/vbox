@@ -5,6 +5,16 @@ import (
 	"strings"
 )
 
+// processEnv 是两个进程入口共用的环境装配：先清洗继承环境，再应用
+// 平台环境和调用方显式覆盖。显式传入的凭据不属于隐式继承的秘密。
+// os/exec 负责同名键去重（后值优先，也处理 Windows 的大小写）。
+func processEnv(env, platform, explicit []string, confined bool) []string {
+	if confined {
+		env = ScrubEnv(env)
+	}
+	return append(append(env, platform...), explicit...)
+}
+
 // 沙箱 env 清洗（自 fsauth env_scrub.go 移植，语义不变）：
 // /proc/*/environ mask 不可行且是假安全感——沙箱进程继承 host 全部环境变量，
 // env 即见；正式对策 = 启动时剥离敏感变量。

@@ -65,7 +65,7 @@ func checkGlobalFS(effect Effect, pattern string) error {
 		return fmt.Errorf("home directory root is not expressible as an allow rule (use fs_policy: open or narrower entries)")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		if h := filepath.ToSlash(home); p == h || p == h+"/" || p == h+"/**" {
+		if h, q := normalizeHostPath(filepath.ToSlash(home)), normalizeHostPath(p); q == h || q == h+"/" || q == h+"/**" {
 			return fmt.Errorf("home directory root is not expressible as an allow rule (use fs_policy: open or narrower entries)")
 		}
 	}
@@ -86,7 +86,7 @@ var driveRootRe = regexp.MustCompile(`(?i)^([a-z]:|/[a-z])(/\*\*)?/?$`)
 // ValidateFSGrantTarget 校验 grant fs 目标（具体绝对路径，非模式）——
 // 与规则行同护栏：全域/家根/盘根不可授。
 func ValidateFSGrantTarget(abs string) error {
-	p := filepath.ToSlash(strings.TrimSpace(abs))
+	p := normalizeHostPath(filepath.ToSlash(strings.TrimSpace(abs)))
 	if p == "" || strings.ContainsRune(p, 0) {
 		return fmt.Errorf("invalid grant target %q", abs)
 	}
@@ -94,7 +94,7 @@ func ValidateFSGrantTarget(abs string) error {
 		return fmt.Errorf("filesystem root cannot be granted (use fs_policy: open or narrower paths)")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		if p == filepath.ToSlash(home) {
+		if p == normalizeHostPath(filepath.ToSlash(home)) {
 			return fmt.Errorf("home directory root cannot be granted (use fs_policy: open or narrower paths)")
 		}
 	}
@@ -104,38 +104,33 @@ func ValidateFSGrantTarget(abs string) error {
 	return nil
 }
 
-// ValidateFSRules 批量校验 fs 规则行（加载/入表即报错；首个非法行即返回）。
+// ValidateFSRules validates the complete compilation, including variable expansion.
 func ValidateFSRules(list []string) error {
-	for _, raw := range list {
-		if _, _, err := ParseFSRule(raw); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := CompileFSRules(list, ClassCfg)
+	return err
 }
 
-// CompileFSRule 编译一条规则行：ParseFSRule + ExpandVars + CanonicalPattern。
-// 展开失败（未定义变量/无家目录）或非法行返回 ok=false（宁缺毋滥——cfg 校验
-// 已在加载/保存路径点名报错）。
-func CompileFSRule(raw string, class Class) (Rule, bool) {
-	eff, pat, err := ParseFSRule(raw)
-	if err != nil {
-		return Rule{}, false
-	}
-	e, ok := ExpandVars(pat)
-	if !ok || e == "" {
-		return Rule{}, false
-	}
-	return Rule{Pattern: CanonicalPattern(e), Effect: eff, Class: class}, true
-}
-
-// CompileFSRules 批量编译（坏行跳过，保序）。
-func CompileFSRules(raws []string, class Class) []Rule {
-	out := make([]Rule, 0, len(raws))
-	for _, raw := range raws {
-		if r, ok := CompileFSRule(raw, class); ok {
-			out = append(out, r)
+// CompileFSRules compiles an ordered table. Both resolved and literal path
+// spellings belong to the same row and retain its priority. Invalid rows reject
+// the entire table; dropping a deny row would widen permissions.
+func CompileFSRules(raws []string, class Class) ([]Rule, error) {
+	var out []Rule
+	for i, raw := range raws {
+		eff, pat, err := ParseFSRule(raw)
+		if err != nil {
+			return nil, fmt.Errorf("rule %d: %w", i+1, err)
+		}
+		expanded, ok := ExpandVars(pat)
+		if !ok || expanded == "" {
+			return nil, fmt.Errorf("rule %d: cannot expand %q", i+1, pat)
+		}
+		if err := checkGlobalFS(eff, expanded); err != nil {
+			return nil, fmt.Errorf("rule %d: %w", i+1, err)
+		}
+		literal := hostPathFromOS(expanded)
+		for _, pattern := range DedupClean([]string{CanonicalPattern(expanded), literal}) {
+			out = append(out, Rule{Pattern: pattern, Effect: eff, Class: class})
 		}
 	}
-	return out
+	return out, nil
 }

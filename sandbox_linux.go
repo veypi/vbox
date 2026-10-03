@@ -33,15 +33,15 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if err := validateProcessPolicy(spec, "linux"); err != nil {
 		return launchPlan{}, err
 	}
-	denyTargets, _, err := denyCoverAllCached(spec.deny, spec.logf)
+	denyTargets, _, err := denyCoverAllCached(spec.denyPatterns(), spec.logf)
 	if err != nil {
 		return launchPlan{}, err
 	}
 	// W3：授权快照经 first-wins 统一求值后落挂载（覆盖/ro/rw 洞与独立 ro
 	// 收紧同出一口）；不可精确表达的 ro 通配行在此拒绝执行。
-	plan, err := evaluateFSPolicy(denyTargets, spec.fsRules, writableMountRoots(spec), spec.fsOpen)
+	plan, err := evaluateFSPolicy(denyTargets, &spec.fsRules, writableMountRoots(spec), spec.fsRules.DefaultWrite == EffRW)
 	if err != nil {
 		return launchPlan{}, err
 	}
-	return launchPlan{argv: bwrapArgs(spec, spec.extra, plan)}, nil
+	return launchPlan{argv: bwrapArgs(spec, spec.writeRoots(), plan)}, nil
 }
