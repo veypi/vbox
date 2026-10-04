@@ -197,6 +197,9 @@ func CanonicalPattern(pat string) string {
 // $UserConfigDir（Go 的 os.UserConfigDir，无对应环境变量）。
 // 任一变量的展开失败（未定义变量、无家目录）使整条模式失配（ok=false）——
 // 初始名单已按平台分表，此规则只防御用户 cfg 条目（写了本平台不存在的变量时宁缺毋滥）。
+// 例外：HOME 与 ~ 同义（unix 惯例变量，Windows 原生只有 USERPROFILE，GUI/schtasks
+// 启动的进程没有 HOME）——缺失/为空时回退 os.UserHomeDir()，否则内置规则表在
+// Windows 上整表编译失败（2026-10-04 win 实机：rule N: cannot expand "$HOME/.aic/**"）。
 func ExpandVars(s string) (string, bool) {
 	home, herr := os.UserHomeDir()
 	if s == "~" {
@@ -219,6 +222,16 @@ func ExpandVars(s string) (string, bool) {
 				return ""
 			}
 			return d
+		}
+		if name == "HOME" {
+			if v := os.Getenv("HOME"); v != "" {
+				return v
+			}
+			if herr != nil {
+				ok = false
+				return ""
+			}
+			return home
 		}
 		v, found := os.LookupEnv(name)
 		if !found {
