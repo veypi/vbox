@@ -39,3 +39,5 @@ fs/net/ssh 的解析与匹配只有本包实现；pod 的 fsauth/netauth 只管�
 `StartOptions.Argv0` 只改变程序展示名称，不参与路径查找或权限身份。直接启动与 Windows 受限令牌启动支持它；Unix 沙箱包装暂不支持时明确报错，不静默忽略、不因此关闭沙箱。
 
 `StartOptions.ReplaceEnv=true` 将 `Env` 作为完整子进程环境，空列表就是空环境；默认仍在继承环境上应用显式覆盖。shell 集成在入口清洗并载入宿主环境，随后使用完整环境模式，避免 `env -i` 或 `unset` 被进程启动器抵消。
+
+`StartOptions.RawOutput=true` 为协议管道和二进制命令保留 stdout/stderr 原始字节与写错误，禁用 Windows 文本转码及行缓冲。输入输出流由调用方管理关闭；双向协议还需在取消时关闭自己的管道，使阻塞读写退出。默认文本模式仅刷新内部转码包装器，不关闭调用方的 writer。

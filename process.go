@@ -20,6 +20,9 @@ type StartOptions struct {
 	Env []string
 	// ReplaceEnv makes Env authoritative, including an intentionally empty environment.
 	ReplaceEnv bool
+	// RawOutput preserves bytes and write errors without line buffering or
+	// Windows code-page conversion. Protocol pipes and binary tools require it.
+	RawOutput bool
 	// NoSandbox 是免沙箱执行标记（hosts-vsh-redesign §3.3），合法来源：
 	//   - 内部管控调用方（ssh/scp、browser，由执行环境自身管控）；
 	//   - 外部请求显式携带 nosandbox（发送前审批；审批本身不免沙箱，
@@ -78,8 +81,10 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	out := newOutputWriter(stdout)
-	errOut := newOutputWriter(stderr)
+	out, errOut := stdout, stderr
+	if !opts.RawOutput {
+		out, errOut = newOutputWriter(stdout), newOutputWriter(stderr)
+	}
 	cmd.Stdout = out
 	cmd.Stderr = errOut
 	SetSysProcAttr(cmd)
@@ -133,11 +138,14 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 		go monitorGroupRSS(h, limit)
 	}
 	err := cmd.Wait()
-	if closer, ok := out.(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
-	if closer, ok := errOut.(interface{ Close() error }); ok {
-		_ = closer.Close()
+	// Caller-owned streams must remain open; only flush wrappers we created.
+	if !opts.RawOutput && runtime.GOOS == "windows" {
+		if closer, ok := out.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		if closer, ok := errOut.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 	}
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
