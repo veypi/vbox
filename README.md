@@ -21,7 +21,7 @@ fs 与 net 两域各有规则集（`FSRuleSet` / `NetRuleSet`）；审批策略�
 ## 三段式接口
 
 规则模型（fsrule.go / net.go）→ 编译（`Compile`，fail-closed——当前平台
-不可表达的规则在启动前拒绝）→ 执行（`Manager`：RunProcess / Spawn）。
+不可表达的规则在启动前拒绝）→ 执行（`Manager`：RunProcess 唯一入口）。
 
 OS 落地（自 aic-pod exec_procs 迁入，2026-09-29；2026-10-01 修订）：darwin
 seatbelt 按 first-wins 快照**逆序**输出（SBPL 后规则胜 → 首命中等价）；ro

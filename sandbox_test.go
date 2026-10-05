@@ -12,23 +12,6 @@ import (
 	"time"
 )
 
-// Confine 无豁免分支：沙箱 profile 由 rules 派生（数字等级已删除），
-// 免沙箱不经 Confine 表达（StartOptions.NoSandbox 才是唯一通道）。
-func TestConfineApprovedStillConfined(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("windows uses token injection, covered by TestWindowsSandbox*")
-	}
-	argv := []string{"bash", "-c", "echo hi"}
-	got, err := Confine("/ws", argv)
-	if err != nil {
-		t.Logf("Confine unavailable on this host (fail-closed): %v", err)
-		return
-	}
-	if len(got) == 0 || got[0] == argv[0] {
-		t.Fatalf("Confine = %v, want wrapped argv", got)
-	}
-}
-
 func TestUnsupportedProcessPolicyRejected(t *testing.T) {
 	for _, tc := range []struct {
 		platform string
@@ -43,24 +26,6 @@ func TestUnsupportedProcessPolicyRejected(t *testing.T) {
 		if err := validateProcessPolicy(tc.spec, tc.platform); err == nil {
 			t.Fatalf("%s accepted unenforceable policy after approval: %+v", tc.platform, tc.spec)
 		}
-	}
-}
-
-// Confine 的 confined 分支：本机有后端（darwin=seatbelt / linux=bwrap）时
-// 返回包装 argv 而非原样；无后端平台（windows/其他）返回 fail-closed 错误。
-// windows 是 argv 原样 + token 注入语义，由 sandbox_windows_test.go 覆盖。
-func TestConfineConfined(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("windows uses token injection, covered by TestWindowsSandbox*")
-	}
-	argv := []string{"bash", "-c", "echo hi"}
-	got, err := Confine("/ws", argv)
-	if err != nil {
-		t.Logf("Confine unavailable on this host (fail-closed): %v", err)
-		return
-	}
-	if len(got) == 0 || got[0] == argv[0] {
-		t.Fatalf("Confine = %v, want wrapped argv", got)
 	}
 }
 

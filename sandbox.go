@@ -116,21 +116,6 @@ func (s confineSpec) writeRoots() []string {
 	return out
 }
 
-// Confine 将 argv 包装为沙箱执行形态（返回替换 argv；windows 的实际
-// confined 路径走 planConfined 的令牌注入，本函数仅供非 windows 调用与
-// 统一测试）。沙箱 profile 由 rules 派生（hosts-vsh-redesign：数字等级
-// 已删除）；免沙箱不经本函数表达（StartOptions.NoSandbox）。
-// 无可用后端返回错误（fail-closed），绝不返回未包装 argv。
-// deny/net 快照恒零值：现调用方仅测试；生产路径必须走 Start（StartOptions
-// 授权快照字段），否则 deny 隔离与网络管控静默缺失。
-func Confine(workdir string, argv []string) ([]string, error) {
-	plan, err := planConfined(confineSpec{workdir: workdir, argv: argv, netRules: NetRuleSet{Default: true}})
-	if err != nil {
-		return nil, err
-	}
-	return plan.argv, nil
-}
-
 // selectBackend 返回本平台后端（功能性探测一次并缓存整个进程生命周期）。
 func selectBackend() sandboxBackend {
 	sandboxMu.Lock()
