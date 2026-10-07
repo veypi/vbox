@@ -15,7 +15,7 @@ func processEnv(env, platform, explicit []string, confined bool) []string {
 	return append(append(env, platform...), explicit...)
 }
 
-// 沙箱 env 清洗（自 fsauth env_scrub.go 移植，语义不变）：
+// 沙箱 env 清洗：
 // /proc/*/environ mask 不可行且是假安全感——沙箱进程继承 host 全部环境变量，
 // env 即见；正式对策 = 启动时剥离敏感变量。
 //

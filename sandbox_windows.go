@@ -3,13 +3,12 @@
 // Windows 沙箱后端（路径 A）：受限令牌（CreateRestrictedToken）+ ACL 授权，
 // host 进程内创建令牌后经 SysProcAttr.Token 注入子进程，无独立 runner。
 //
-// 机制（与 dsh sandbox-windows-acl / codex windows-sandbox-rs 同模型，
-// Go 原生实现）：
+// 机制（Go 原生实现）：
 //   - 受限令牌：flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED，
 //     restricting list = logon SID + Everyone + 能力 SID（工作区/私有临时）+
 //     per-call deny SID。写类访问做两次检查（正常 SID + restricting SID），
 //     两次都通过才放行 —— restricting 列表即进程的写白名单；读不做第二次
-//     检查（WRITE_RESTRICTED 只交叉检查写访问，dsh/codex 同边界）。
+//     检查（WRITE_RESTRICTED 只交叉检查写访问）。
 //   - 能力 SID 是确定性派生（路径哈希）或随机（私有临时目录）的自定义 SID，
 //     对应目录的 DACL 上授予完全访问 ACE：
 //   - 工作区：standing ACE，幂等授权——每次调用先检查 DACL 是否已有该
@@ -21,8 +20,8 @@
 //     写被拒。
 //   - fs deny：per-call 随机 SID 的完全拒绝 ACE（DENY 置于 ACL 首部、继承
 //     到子对象；其他进程无该 SID 不受影响）——写被拒（pass-2 命中 deny）；
-//     读不在 WRITE_RESTRICTED 检查范围（Windows 边界：读侧隔离需另一机制，
-//     与 dsh/codex 一致）；进程结束后撤销。
+//     读不在 WRITE_RESTRICTED 检查范围（Windows 边界的固有限制：读侧隔离
+//     需另一机制）；进程结束后撤销。
 //   - spawn 控制台策略：保持既有 CREATE_NO_WINDOW（proc_windows.go
 //     SetSysProcAttr）——restricting 列表正确时各控制台模式均可启动
 //
@@ -80,8 +79,7 @@ const (
 	subContainersAndObjectsInherit = 3 // 子目录 + 文件继承 ACE
 	fileAllAccess                  = 0x001F01FF
 
-	// CreateRestrictedToken Flags（dsh sandbox-windows-acl / codex
-	// windows-sandbox-rs 同款组合，Win11 26200 实测）：
+	// CreateRestrictedToken Flags（Win11 26200 实测组合）：
 	//   - DISABLE_MAX_PRIVILEGE：除 SeChangeNotifyPrivilege 外特权全禁；
 	//   - LUA_TOKEN：LUA 令牌；
 	//   - WRITE_RESTRICTED：restricting SID 仅参与写访问的第二次检查
@@ -97,13 +95,12 @@ const (
 	writeRestricted     = 0x8
 )
 
-// createRestrictedToken 创建受限令牌（dsh sandbox-windows-acl / codex
-// windows-sandbox-rs 同款组合）：restricting list = logon SID + Everyone +
+// createRestrictedToken 创建受限令牌：restricting list = logon SID + Everyone +
 // 能力 SIDs（工作区/私有临时）+ per-call deny SID；flags =
 // DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED。
 // 随后设置宽松默认 DACL：沙箱进程新建对象（pipe/IPC 等）的自身 DACL
-// 必须能命中 restricting SID，否则新建即被 pass-2 写检查拒
-// （codex/dsh 同策略）；结尾显式启用 SeChangeNotifyPrivilege。
+// 必须能命中 restricting SID，否则新建即被 pass-2 写检查拒；结尾显式启用
+// SeChangeNotifyPrivilege。
 // 现有令牌必须以 TOKEN_ALL_ACCESS 打开——实测 TOKEN_QUERY|TOKEN_DUPLICATE
 // 句柄调用 CreateRestrictedToken 返回 Access denied（win11 26200）。
 func createRestrictedToken(extraSids []*windows.SID) (windows.Token, error) {
@@ -124,9 +121,9 @@ func createRestrictedToken(extraSids []*windows.SID) (windows.Token, error) {
 	// 列表刻意不含用户 SID 与 INTERACTIVE/Authenticated Users/BUILTIN
 	// Users：这些身份在宿主上有大量环境写授权（用户自有文件、C:\ 根树、
 	// Public 树、WMI 命名空间等），进入 restricting 列表等于把这些写路径
-	// 全部放行——写白名单的唯一粒度 = 能力 SID（dsh 同款裁剪）。
+	// 全部放行——写白名单的唯一粒度 = 能力 SID。
 	// [logon SID, Everyone] 保底：缺它们在 Win11 下早期 DLL 初始化即
-	// STATUS_DLL_INIT_FAILED、CNG 写失败（pwsh 崩溃）——dsh 实测记录。
+	// STATUS_DLL_INIT_FAILED、CNG 写失败（pwsh 崩溃）——实测记录。
 	restrictions := []windows.SIDAndAttributes{
 		{Sid: logonSid},
 		{Sid: everyone},
@@ -176,8 +173,8 @@ func createRestrictedToken(extraSids []*windows.SID) (windows.Token, error) {
 }
 
 // enableChangeNotify 显式启用 SeChangeNotifyPrivilege（目录遍历旁路）。
-// 该特权本应被 DISABLE_MAX_PRIVILEGE 保留，显式启用为对齐已实测的参考
-// 实现（codex windows-sandbox-rs 同做法），防 LUA 令牌下被禁。
+// 该特权本应被 DISABLE_MAX_PRIVILEGE 保留，这里显式启用（实测需要），
+// 防 LUA 令牌下被禁。
 func enableChangeNotify(token windows.Token) error {
 	name, err := windows.UTF16PtrFromString("SeChangeNotifyPrivilege")
 	if err != nil {
@@ -415,7 +412,7 @@ func probeBackend() sandboxBackend {
 //     standing ACE + per-call 私有临时目录（TMP/TEMP 指向它），进程结束后清理
 //   - deny：稳定 deny SID 加入 restricting list，对 deny 目标确保存在完全拒绝
 //     ACE（写被拒——WRITE_RESTRICTED 的 pass-2 只覆盖写访问，读不在受限令牌
-//     可表达范围（Windows 边界，与 dsh/codex 一致：读侧隔离需另一机制，fs 工具
+//     可表达范围（Windows 边界：读侧隔离需另一机制，fs 工具
 //     层不受影响）；ACE 继承到子对象并持久保留，到期对账见持久模型注释）；
 //     模式形态不可实例化或可达对象加不上 ACE → 拒绝执行（fail-closed）
 //   - 资源限制：Job Object（进程内存 4GiB / job 内存 8GiB / 活动进程 256），
@@ -481,7 +478,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 
 		// per-call 私有临时目录：随机路径 + 随机 SID，进程结束后删除
 		var err error
-		tmpDir, err = os.MkdirTemp("", "aic-sandbox-*")
+		tmpDir, err = os.MkdirTemp("", "vbox-sandbox-*")
 		if err != nil {
 			return launchPlan{}, fmt.Errorf("sandbox: private temp: %w", err)
 		}
@@ -643,13 +640,13 @@ func randomDenySID() (*windows.SID, error) {
 // 这些对象彼此独立，并发跑互不相干。
 const denyACLWorkers = 8
 
-// ---- 持久 deny ACE（codex windows-sandbox-rs 同模型，2026-09-23 改）----
+// ---- 持久 deny ACE（2026-09-23 改）----
 //
 // 稳定 deny SID + 持久 ACE + 幂等 ensure（有则跳过），不再「每调用随机 SID、
 // 全量打、全量撤」：
 //  1) 旧模型每条命令对上百个目标做两轮 Get/Set（79 目标 ≈ 施加 1.3s + 撤销
-//     1.3s）；codex 的稳定 SID + 幂等 ensure 在稳态下零 ACL 操作；
-//  2) 沙箱进程的后代可能比 launcher 活得久（codex 同款理由）——进程结束即
+//     1.3s）；稳定 SID + 幂等 ensure 在稳态下零 ACL 操作；
+//  2) 沙箱进程的后代可能比 launcher 活得久——进程结束即
 //     撤销会把仍在运行的后代暴露在无 deny 状态，持久 ACE 反而更安全；
 //  3) 残留 ACE 只对稳定 deny SID 生效：该 SID 仅出现在沙箱进程令牌的
 //     restricting list 中，宿主机其他进程（含用户自己）不受影响。
@@ -664,19 +661,23 @@ const denyACLStateFile = "deny_acl_state.json"
 // denyACLStatePathOverride 供测试改写状态文件路径（空 = 用户配置目录默认位置）。
 var denyACLStatePathOverride string
 
-// denyACLStatePath 返回状态文件路径（{UserConfigDir}/aic/sandbox/deny_acl_state.json）。
+// denyACLStatePath 返回状态文件路径，优先级：测试改写 > Manager.SetStateDir >
+// 默认 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`。
 func denyACLStatePath() string {
 	if denyACLStatePathOverride != "" {
 		return denyACLStatePathOverride
+	}
+	if dir, _ := stateDirOverride.Load().(string); dir != "" {
+		return filepath.Join(dir, denyACLStateFile)
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(dir, "aic", "sandbox", denyACLStateFile)
+	return filepath.Join(dir, "vbox", "sandbox", denyACLStateFile)
 }
 
-// denyACLState 是持久状态（codex deny_read_acl_state.json 同构）。
+// denyACLState 是持久状态（记录稳定 SID 已打 ACE 的路径）。
 type denyACLState struct {
 	SID     string   `json:"sid"`
 	Applied []string `json:"applied"`
@@ -689,6 +690,9 @@ var (
 
 // stableDenySID 返回跨调用/重启稳定的 deny SID（能力 SID 确定性派生：同一
 // 安装恒得同一 SID，已打 ACE 长期有效）。
+//
+// 注意：这个派生命名是内部标识，改它会让旧 ACE 变成无法回收的残留（对没有该
+// SID 的进程无害但会永久留在 ACL 里）——需要改名时应同时提供一次旧 SID 清理。
 func stableDenySID() (*windows.SID, error) {
 	return capabilitySID("deny", "aic-windows-sandbox")
 }
@@ -908,10 +912,9 @@ func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf
 	return sid, nil
 }
 
-// ensureDenyACE 确保对象带稳定 SID 的拒绝 ACE（先读校验、缺才写——codex
-// add_deny_write_ace 同款幂等语义）。added = 本次写入；present = 对象当前已
-// 有该 ACE（含本次写入）。对象不可读 → (false, false, nil) 跳过（与
-// addDenyACE 的不可达口径一致）。
+// ensureDenyACE 确保对象带稳定 SID 的拒绝 ACE（先读校验、缺才写）。added = 本次
+// 写入；present = 对象当前已有该 ACE（含本次写入）。对象不可读 → (false, false,
+// nil) 跳过（与 addDenyACE 的不可达口径一致）。
 func ensureDenyACE(path string, sid *windows.SID, restricted []*windows.SID) (added, present bool, err error) {
 	sd, err := aclReadDACL(path)
 	if err != nil {
@@ -1071,7 +1074,7 @@ func removeAcesForSID(dacl *windows.ACL, sid *windows.SID) (*windows.ACL, bool, 
 // revokeDenyACE 撤销本调用追加的 deny ACE：取对象当前 DACL，字节级重建副本
 // （删除该 SID 的全部 ACE）后应用。不走 SetEntriesInAcl 的 REVOKE_ACCESS
 // 合并——win11 26200 实测该路径返回 ERROR_SUCCESS 但 deny 类 ACE 残留
-// （带/不带继承位均如此；同样形态在 codex/dsh 环境可用，本机行为未再归因），
+// （带/不带继承位均如此；本机行为未再归因），
 // 字节级重建与 ACL 编辑器删除 ACE 同语义。返回错误供诊断/调用方处理
 // （撤销调用方仍为 best-effort 语义）。
 func revokeDenyACE(path string, denySid *windows.SID) error {

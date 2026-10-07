@@ -29,12 +29,12 @@ func TestSeatbeltFSRulesReversedEmission(t *testing.T) {
 		{Pattern: "/tmp/granted", Effect: EffRW, Class: ClassTemp},
 		{Pattern: "/Users/v/.cache/**", Effect: EffRW, Class: ClassCfg},
 		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
-		{Pattern: "/Users/v/aic", Effect: EffRW, Class: ClassConvenience},
+		{Pattern: "/Users/v/work", Effect: EffRW, Class: ClassConvenience},
 	}, DefaultWrite: EffDeny}
 	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo", "hi"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	idx := func(sub string) int { return strings.Index(profile, sub) }
 	// 逆序：便利根（表尾）最先输出，temp（表头）最后输出。
-	iConv := idx(`(allow file-write* (subpath "/Users/v/aic"))`)
+	iConv := idx(`(allow file-write* (subpath "/Users/v/work"))`)
 	iDeny := idx(`(deny file-write* (regex "^(.*)?/\\.ssh(/.*)?$"))`)
 	iCfg := idx(`(allow file-write* (regex "^/Users/v/\\.cache(/.*)?$"))`)
 	iTemp := idx(`(allow file-write* (subpath "/tmp/granted"))`)

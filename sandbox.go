@@ -695,7 +695,7 @@ func denyCoverAllCached(pats []string, logf func(string, ...any)) (targets []str
 // ---- darwin: Seatbelt (sandbox-exec) ----
 
 // macosSeatbeltExecutable 是 sandbox-exec 的固定路径（防 PATH 注入：
-// 若 /usr/bin/sandbox-exec 被篡改，攻击者已 root——codex 同策略）。
+// 若 /usr/bin/sandbox-exec 被篡改，攻击者已 root）。
 const macosSeatbeltExecutable = "/usr/bin/sandbox-exec"
 
 // seatbeltArgs 将文件规则表逆序映射到 SBPL，保持 first-wins 语义。

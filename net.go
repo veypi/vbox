@@ -9,8 +9,7 @@ import (
 	"unicode"
 )
 
-// 网络目标条目与规则集（自 aic-pod libs/policy network.go + netauth 合并移植，
-// 语义反转为 first-wins）。
+// 网络目标条目与规则集（first-wins 语义）。
 
 // Entry 归一化目标条目（Host 小写/IP 归一，Port 数字串或 *）。
 type Entry struct {

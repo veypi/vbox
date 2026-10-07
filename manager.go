@@ -31,6 +31,14 @@ func NewManager() *Manager {
 	return &Manager{running: map[*procHandle]struct{}{}}
 }
 
+// stateDirOverride 是调用方显式指定的沙箱持久状态目录（空 = 平台默认目录）。
+var stateDirOverride atomic.Value // string
+
+// SetStateDir 指定沙箱持久状态目录（Windows 的 deny ACE 对账状态文件所在目录；
+// 默认 `{UserConfigDir}/vbox/sandbox`）。该状态是机器级的（同一台机器只有一份
+// ACE 对账记录），进程内多次设置以后者为准；只影响之后的对账写入与读取。
+func (m *Manager) SetStateDir(dir string) { stateDirOverride.Store(dir) }
+
 func (m *Manager) SetNoSandbox(value bool) { m.noSandbox.Store(value) }
 
 // SetLogf 注入沙箱/执行阶段计时日志（pod 侧接 host 的 OnLog；nil 忽略）。

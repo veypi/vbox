@@ -15,8 +15,8 @@ import (
 // 无 canonical 化，故名单须同时含字面形与解析形）。
 //
 // 2026-09-24：windows 规范形全局统一为 /c/ 类 Linux 形（废除 C:/ 盘符形）——
-// canonical 出口一律 /c/…；入口接受任意盘符形态容错归一。以下三个helper
-// 与 aic-pod/libs/proto 同源（vbox 自持不引 aic-pod，避免模块环）。
+// canonical 出口一律 /c/…；入口接受任意盘符形态容错归一。以下三个 helper
+// 为本库自持实现（不引入外部模块依赖），口径与调用方的宿主路径语义一致。
 
 // normalizeHostPath 把 windows 盘符输入归一为 /c/… 规范形（纯语法、与 GOOS
 // 无关——匹配层与执行层结果必须一致，归一不按 GOOS 分叉）；非盘符形态
@@ -58,7 +58,7 @@ func isLetterByte(b byte) bool {
 
 // hostPathToOS 把 /c/ 规范形（及旧输入形）转回 OS 原生路径（windows；posix
 // 恒等——"C:" 是合法相对文件名，不做盘符归一）。windows 上 /tmp 是虚拟别名：
-// cygwin 式映射 os.TempDir()（与 aic-pod/libs/proto.HostPathToOS 同口径——
+// cygwin 式映射 os.TempDir()（与宿主路径口径同源——
 // /tmp 查询 canonical 后落进临时目录便利根，无需字面 /tmp 规则行）。
 // 导出供沙箱名单派生（OS 边界单一转换点）与嵌入方使用。
 func HostPathToOS(p string) string {
@@ -75,9 +75,8 @@ func HostPathToOS(p string) string {
 	return p
 }
 
-// tmpToOS 把 /tmp（及子路径）映射为 windows 临时目录原生路径（与
-// aic-pod/libs/proto.WinTmpToOS 同源——vbox 自持不引 aic-pod，避免模块环）。
-// 纯函数（tmpDir 注入，跨平台可测）。
+// tmpToOS 把 /tmp（及子路径）映射为 windows 临时目录原生路径（本库自持实现，
+// 不引入外部模块依赖）。纯函数（tmpDir 注入，跨平台可测）。
 func tmpToOS(p, tmpDir string) (string, bool) {
 	if p != "/tmp" && !strings.HasPrefix(p, "/tmp/") {
 		return "", false
@@ -199,7 +198,7 @@ func CanonicalPattern(pat string) string {
 // 初始名单已按平台分表，此规则只防御用户 cfg 条目（写了本平台不存在的变量时宁缺毋滥）。
 // 例外：HOME 与 ~ 同义（unix 惯例变量，Windows 原生只有 USERPROFILE，GUI/schtasks
 // 启动的进程没有 HOME）——缺失/为空时回退 os.UserHomeDir()，否则内置规则表在
-// Windows 上整表编译失败（2026-10-04 win 实机：rule N: cannot expand "$HOME/.aic/**"）。
+// Windows 上整表编译失败（2026-10-04 win 实机：rule N: cannot expand "$HOME/<内置条目>/**"）。
 func ExpandVars(s string) (string, bool) {
 	home, herr := os.UserHomeDir()
 	if s == "~" {

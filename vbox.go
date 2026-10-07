@@ -14,7 +14,8 @@
 //
 // 配置解析、默认规则源、会话授权、grant 生命周期与审批策略都属调用方（宿主集成层）；
 // vbox 每次调用接收一份编译好的快照，不维护授权状态。Windows 侧仅为拒绝 ACE 的
-// 幂等对账保留一份状态文件（{UserConfigDir}/aic/sandbox/deny_acl_state.json）。
+// 幂等对账保留一份状态文件（默认 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`，
+// 可用 Manager.SetStateDir 改）。
 package vbox
 
 // Effect 规则行效果。

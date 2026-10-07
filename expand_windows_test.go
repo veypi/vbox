@@ -11,7 +11,7 @@ import (
 // TestExpandVarsHomeWithoutEnv：Windows 的 GUI/schtasks 启动进程只有
 // USERPROFILE、没有 HOME。此时 $HOME/... 与 ~/... 都必须落到 USERPROFILE
 // （os.UserHomeDir 口径），否则内置 deny 表无法编译、host 起不来
-// （2026-10-04 win 实机：rule 30: cannot expand "$HOME/.aic/browser/**"）。
+// （2026-10-04 win 实机：rule 30: cannot expand "$HOME/.cache/browser/**"）。
 func TestExpandVarsHomeWithoutEnv(t *testing.T) {
 	prev, had := os.LookupEnv("HOME")
 	if err := os.Unsetenv("HOME"); err != nil {
@@ -26,8 +26,8 @@ func TestExpandVarsHomeWithoutEnv(t *testing.T) {
 	if err != nil || home == "" {
 		t.Skipf("no home dir: %v", err)
 	}
-	want := filepath.ToSlash(home) + "/.aic/browser/**"
-	for _, pat := range []string{"$HOME/.aic/browser/**", "~/.aic/browser/**"} {
+	want := filepath.ToSlash(home) + "/.cache/browser/**"
+	for _, pat := range []string{"$HOME/.cache/browser/**", "~/.cache/browser/**"} {
 		got, ok := ExpandVars(pat)
 		if !ok {
 			t.Fatalf("ExpandVars(%q) failed with HOME unset", pat)
@@ -36,7 +36,7 @@ func TestExpandVarsHomeWithoutEnv(t *testing.T) {
 			t.Fatalf("ExpandVars(%q)=%q, want %q", pat, got, want)
 		}
 	}
-	if _, err := CompileFSRules([]string{"deny:$HOME/.aic/browser/**", "deny:~/.aic/browser/**"}, ClassCfg); err != nil {
+	if _, err := CompileFSRules([]string{"deny:$HOME/.cache/browser/**", "deny:~/.cache/browser/**"}, ClassCfg); err != nil {
 		t.Fatalf("builtin deny rows must compile with HOME unset: %v", err)
 	}
 }
