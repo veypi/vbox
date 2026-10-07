@@ -1,14 +1,20 @@
-// Package vbox 原生子进程沙箱库：规则模型 + 纯判定 + OS 落地（Seatbelt/bwrap/
-// 受限令牌）+ 进程生命周期。不知道 shell、审批、grant 持久化——配置解析与
-// grant 生命周期在调用方（aic-pod libs/host），每次调用编译快照传入。
+// Package vbox 是原生子进程沙箱库：规则模型 + 纯判定 + OS 落地（Seatbelt /
+// bubblewrap / 受限令牌 + ACL）+ 进程生命周期。
 //
-// 规则语义（2026-09-23 用户拍板；契约见 aic/docs/permission_rules.md）：单一有序表，
-// 从前向后扫、首命中生效；新规则一律插表头。行为完全由行序决定，无"谁压谁"
-// 的特殊规则；审批策略属产品层，不进本包。
+// 它只做三件事：
 //
-// 与 aic-pod fsauth/netauth 的关系：本包是其纯 matcher 的 first-wins 重写
-// （语义反转：last-wins → first-wins），状态层（cfg 耦合/Reconcile/tempTables/
-// 持久化）与默认策略源（defaultDenyPaths/CacheRoots）留在 pod。
+//   - 规则模型：FS 与 Net 各一张有序表，从前向后扫描、首命中生效（first-wins）。
+//     行首是效果前缀：文件域 ro:/rw:/deny:，网络域 allow:/deny:（host:port）。
+//     行为完全由行序决定，没有「谁压谁」的特殊规则；Class 只用于调用方拼接行序，
+//     判定时不看。
+//   - 判定：纯函数匹配（MatchPath / Match / MatchNoFollow / NetRuleSet.Resolve），
+//     不访问宿主文件系统，也不读配置。
+//   - 落地：把编译好的快照交给内核机制执行；当前平台无法表达的规则在启动前拒绝
+//     （fail-closed），绝不静默降级为裸跑。RunProcess 是唯一进程入口。
+//
+// 配置解析、默认规则源、会话授权、grant 生命周期与审批策略都属调用方（宿主集成层）；
+// vbox 每次调用接收一份编译好的快照，不维护授权状态。Windows 侧仅为拒绝 ACE 的
+// 幂等对账保留一份状态文件（{UserConfigDir}/aic/sandbox/deny_acl_state.json）。
 package vbox
 
 // Effect 规则行效果。

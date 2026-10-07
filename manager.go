@@ -1,8 +1,5 @@
-// Package vbox 原生子进程沙箱库：规则模型 + 纯判定 + OS 落地（Seatbelt/bwrap/
-// 受限令牌）+ 进程生命周期（Manager/RunProcess/Spawn）。不知道 shell、审批、
-// grant 持久化——配置解析与 grant 生命周期在调用方（aic-pod libs/host），
-// 每次调用编译快照传入。本文件是进程托管层（自 aic-pod libs/exec_procs 迁入，
-// 2026-09-29 W2）。
+// 本文件是进程托管层：Manager 负责进程启动（沙箱包装由 sandbox_*.go 提供）、
+// 取消与期限（ctx）、输出分流、在跑进程登记与 Close 统一回收。
 package vbox
 
 import (
