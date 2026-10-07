@@ -130,9 +130,7 @@ func TestMatchNoFollowSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := filepath.Join(writable, "venv-python")
-	if err := os.Symlink(outside, link); err != nil {
-		t.Fatal(err)
-	}
+	requireSymlink(t, outside, link)
 
 	set := NewFSRuleSet(
 		[]Rule{

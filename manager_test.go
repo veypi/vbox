@@ -14,7 +14,7 @@ func TestRunProcessNormalCompletion(t *testing.T) {
 	// 与沙箱无关：全局免沙箱隔离环境差异
 	m.SetNoSandbox(true)
 	var out bytes.Buffer
-	code, err := m.RunProcess(context.Background(), StartOptions{Exec: []string{"bash", "-c", "printf 'a\\nb\\nc\\n'"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
+	code, err := m.RunProcess(context.Background(), StartOptions{Exec: []string{requirePOSIXShell(t), "-c", "printf 'a\\nb\\nc\\n'"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestRunProcessCancel(t *testing.T) {
 	defer cancel()
 	var out bytes.Buffer
 	start := time.Now()
-	_, err := m.RunProcess(ctx, StartOptions{Exec: []string{"bash", "-c", "printf 'partial\\n'; sleep 30"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
+	_, err := m.RunProcess(ctx, StartOptions{Exec: []string{requirePOSIXShell(t), "-c", "printf 'partial\\n'; sleep 30"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
 	if err == nil {
 		t.Fatal("cancelled process should report ctx error")
 	}
@@ -59,7 +59,7 @@ func TestManagerCloseKillsRunning(t *testing.T) {
 	go func() {
 		defer close(done)
 		var out bytes.Buffer
-		_, _ = m.RunProcess(context.Background(), StartOptions{Exec: []string{"bash", "-c", "sleep 30"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
+		_, _ = m.RunProcess(context.Background(), StartOptions{Exec: []string{requirePOSIXShell(t), "-c", "sleep 30"}, Policy: Policy{FS: FSRuleSet{DefaultWrite: EffRW}, Net: NetRuleSet{Default: true}}}, nil, &out, &out)
 	}()
 	// 等进程起来
 	time.Sleep(300 * time.Millisecond)

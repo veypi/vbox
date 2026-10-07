@@ -67,6 +67,13 @@ func runWithPlan(t *testing.T, plan launchPlan, argv []string, workdir string) (
 }
 
 // writeCmd 构造 cmd /c 写文件命令（> 重定向）。
+// canonRules 把裸构造的规则行按 canonical 归一（与 NewFSRuleSet / CompileFSRules
+// 同口径）。契约：直接字面构造 FSRuleSet 时模式必须自行保证 canonical（见
+// NewFSRuleSet 注）。本文件早期用例用 OS 原生反斜杠路径裸构造，win 上 rw 行因此
+// 不被识别 → 工作区根被当 ro 目标打写拒 ACE → 子进程写整个工作区被拒
+// （2026-10-07 win 实机：exit=1 拒绝访问）。
+func canonRules(rows []Rule) []Rule { return NewFSRuleSet(rows, EffDeny).Rules }
+
 func writeCmd(path string) []string {
 	return []string{"cmd", "/c", "echo x > " + path}
 }
@@ -194,20 +201,20 @@ func TestWindowsSandboxRejectsUnsupportedPolicy(t *testing.T) {
 // TMP/TEMP 注入：受限进程看到的是私有临时目录。
 func TestWindowsSandboxTempEnv(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo TMP=[%TMP%]"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo TMP=[%TMP%]"}, fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
 	out, exit := runWithPlan(t, plan, plan.argv, ws)
-	if exit != 0 || !strings.Contains(out, "aic-sandbox") {
-		t.Fatalf("TMP should point at private aic-sandbox dir: exit=%d out=%q", exit, out)
+	if exit != 0 || !strings.Contains(out, "vbox-sandbox") {
+		t.Fatalf("TMP should point at private vbox-sandbox dir: exit=%d out=%q", exit, out)
 	}
 }
 
 // cleanup：进程结束后私有临时目录被删除。
 func TestWindowsSandboxCleanupRemovesTemp(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo %TMP%"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo %TMP%"}, fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -284,9 +291,9 @@ func aclDenyAceCount(t *testing.T, path string) int {
 
 // deny（Windows 边界，持久 ACE 模型）：稳定 SID 的拒绝 ACE 使目标【写】被拒
 // （pass-2 写检查命中 deny）；读不在 WRITE_RESTRICTED 的交叉检查范围——deny
-// 不拦读（Windows 受限令牌的数据边界，与 dsh/codex 一致；读侧隔离需另一机制，
-// fs 工具层 deny 不受影响）；ACE 持久保留（不随进程结束撤销，codex 同款：
-// 后代可能比 launcher 活得久），幂等 ensure 不重复打。
+// 不拦读（Windows 受限令牌的固有限制；读侧隔离需另一机制，fs 工具层 deny
+// 不受影响）；ACE 持久保留（不随进程结束撤销：后代可能比 launcher 活得久），
+// 幂等 ensure 不重复打。
 func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	// 状态文件隔离：不污染真实用户状态，并清进程内快照
 	oldOverride := denyACLStatePathOverride
@@ -309,7 +316,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	before := aclDenyAceCount(t, secret)
 
 	// 写 deny：白名单内可写路径上的 deny 文件写也必须失败且内容不变
-	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -328,7 +335,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 		t.Fatalf("deny ACE must persist after run: before=%d after=%d", before, got)
 	}
 	// 幂等：再次 plan 同一目标不重复打 ACE（状态对账命中，零 ACL 写）
-	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(secret), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined (again): %v", err)
 	}
 	if got := aclDenyAceCount(t, secret); got != before+1 {
@@ -339,7 +346,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 	// 若未来引入读侧隔离机制，此断言需随之更新）。
 	// 用相对路径：os/exec 会把 argv 内嵌引号转义成 \"，cmd 解析后报"文件名…
 	// 语法不正确"；cmd cwd 即 ws，相对路径避开引号。
-	plan2, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type secret.key"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type secret.key"}, fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -350,7 +357,7 @@ func TestWindowsDenyWriteACEAndCleanup(t *testing.T) {
 
 	// 非 deny 路径：白名单内写正常
 	open := filepath.Join(ws, "open.txt")
-	plan3, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(open), fsRules: FSRuleSet{Rules: []Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan3, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(open), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: secret, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -391,7 +398,7 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 	}
 	rules := FSRuleSet{Rules: rows}
 
-	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(head), fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(head), fsRules: FSRuleSet{Rules: append(rules.Rules, canonRules([]Rule{{Pattern: ws, Effect: EffRW}})...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -407,7 +414,7 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 	}
 	// 兄弟路径可写（ro 只收紧目标子树）。
 	okFile := filepath.Join(ws, "ok.txt")
-	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(okFile), fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(okFile), fsRules: FSRuleSet{Rules: append(rules.Rules, canonRules([]Rule{{Pattern: ws, Effect: EffRW}})...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -415,7 +422,7 @@ func TestWindowsSandboxRoRowProtectsWorkspaceMetadata(t *testing.T) {
 		t.Fatalf("sibling write should succeed: %s", out2)
 	}
 	// 读放行。
-	plan3, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type .git\\HEAD"}, fsRules: FSRuleSet{Rules: append(rules.Rules, []Rule{{Pattern: ws, Effect: EffRW}}...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
+	plan3, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "type .git\\HEAD"}, fsRules: FSRuleSet{Rules: append(rules.Rules, canonRules([]Rule{{Pattern: ws, Effect: EffRW}})...), DefaultWrite: rules.DefaultWrite}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -449,7 +456,7 @@ func TestWindowsDenyStaleRevocation(t *testing.T) {
 	}
 	beforeA := aclDenyAceCount(t, a)
 
-	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(a), fsRules: FSRuleSet{Rules: []Rule{{Pattern: a, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(a), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: a, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined(a): %v", err)
 	}
 	if got := aclDenyAceCount(t, a); got != beforeA+1 {
@@ -457,7 +464,7 @@ func TestWindowsDenyStaleRevocation(t *testing.T) {
 	}
 
 	// 目标集变化（a → b）：a 的 ACE 应被对账撤销，b 打上
-	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(b), fsRules: FSRuleSet{Rules: []Rule{{Pattern: b, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}}); err != nil {
+	if _, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(b), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: b, Effect: EffDeny}, {Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}}); err != nil {
 		t.Fatalf("planConfined(b): %v", err)
 	}
 	if got := aclDenyAceCount(t, a); got != beforeA {
@@ -476,7 +483,7 @@ func TestWindowsSandboxWriteConfinement(t *testing.T) {
 	inFile := filepath.Join(ws, "in.txt")
 	outFile := filepath.Join(outside, "out.txt")
 
-	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(inFile), fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(inFile), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -487,7 +494,7 @@ func TestWindowsSandboxWriteConfinement(t *testing.T) {
 		t.Fatalf("granted workspace write did not materialize: %v", err)
 	}
 
-	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(outFile), fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan2, err := planConfined(confineSpec{workdir: ws, argv: writeCmd(outFile), fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -536,7 +543,7 @@ func TestWindowsJobLimits(t *testing.T) {
 
 	// planConfined 集成：job 句柄随 plan 返回，子进程 assign 后正常执行
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo ok"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "echo ok"}, fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}
@@ -550,7 +557,7 @@ func TestWindowsJobLimits(t *testing.T) {
 }
 
 // 诊断矩阵：受限令牌（WRITE_RESTRICTED|LUA）下各控制台模式的可启动性——
-// dsh 实测记录 CREATE_NO_WINDOW / CREATE_NEW_CONSOLE 子进程 DLL init 必死
+// 实测记录：CREATE_NO_WINDOW / CREATE_NEW_CONSOLE 子进程 DLL init 必死
 // （STATUS_DLL_INIT_FAILED 0xC0000142），共享控制台可存活。用
 // cmd /c exit /b 7 观察退出码即可判定（7 = 正常启动）。
 func TestWindowsConsoleModeMatrix(t *testing.T) {
@@ -583,7 +590,7 @@ func TestWindowsConsoleModeDetachedStage(t *testing.T) {
 // 的实际状态（定位“授权目录内写仍被拒”的成因）。
 func TestWindowsGrantDiag(t *testing.T) {
 	ws := t.TempDir()
-	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "exit /b 0"}, fsRules: FSRuleSet{Rules: []Rule{{Pattern: ws, Effect: EffRW}}}, netRules: NetRuleSet{Default: true}})
+	plan, err := planConfined(confineSpec{workdir: ws, argv: []string{"cmd", "/c", "exit /b 0"}, fsRules: FSRuleSet{Rules: canonRules([]Rule{{Pattern: ws, Effect: EffRW}})}, netRules: NetRuleSet{Default: true}})
 	if err != nil {
 		t.Fatalf("planConfined: %v", err)
 	}

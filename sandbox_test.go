@@ -36,7 +36,7 @@ func TestManagerNoSandboxGlobal(t *testing.T) {
 	m.SetNoSandbox(true)
 	var out bytes.Buffer
 	code, err := m.RunProcess(context.Background(), StartOptions{
-		Exec: []string{"sh", "-c", "echo hi"},
+		Exec: []string{requirePOSIXShell(t), "-c", "echo hi"},
 	}, nil, &out, &out)
 	if err != nil {
 		t.Fatalf("run with global NoSandbox: %v", err)
@@ -51,7 +51,7 @@ func TestManagerNoSandboxGlobal(t *testing.T) {
 func TestUnconfinedIgnoresPolicy(t *testing.T) {
 	m := NewManager()
 	var out bytes.Buffer
-	code, err := m.RunProcess(context.Background(), StartOptions{NoSandbox: true, Exec: []string{"sh", "-c", "echo hi"}, Policy: Policy{FS: FSRuleSet{Rules: []Rule{{Pattern: "/private/**", Effect: EffDeny}}}, Net: NetRuleSet{}}}, nil, &out, &out)
+	code, err := m.RunProcess(context.Background(), StartOptions{NoSandbox: true, Exec: []string{requirePOSIXShell(t), "-c", "echo hi"}, Policy: Policy{FS: FSRuleSet{Rules: []Rule{{Pattern: "/private/**", Effect: EffDeny}}}, Net: NetRuleSet{}}}, nil, &out, &out)
 	if err != nil {
 		t.Fatalf("run with nosandbox under restricted policy: %v", err)
 	}
@@ -460,6 +460,11 @@ func TestGlobToSBPLRegex(t *testing.T) {
 // 得 EPERM，覆盖项丢失造成假失败（实测 2026-09-05）。
 // 每个形态单独实例化：父目录目标会剪掉子孙（覆盖等价），混在一组会互相吞并。
 func TestBwrapDenyArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// bwrap 覆盖参数是 unix 语义（--ro-bind /dev/null 覆盖、** 模式以
+		// $HOME 为递归起点），Windows 无 bwrap 后端也无对应路径形态。
+		t.Skip("bwrap cover args are unix-only (no bwrap backend on windows)")
+	}
 	dir := t.TempDir()
 	file := filepath.Join(dir, "secret.dat")
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
@@ -551,17 +556,19 @@ func TestWindowsPolicyValidation(t *testing.T) {
 // denyCoverAll 形态判定：支持形态（字面、尾 /**、单 glob、** 递归）；
 // 不可实例化形态（无字面前缀的全 glob）返回错误；子孙目标被父目录剪枝。
 func TestDenyCoverAll(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "secret.dat")
+	// 目标与期望一律用 / 形（denyCoverAll 内部 filepath.ToSlash 归一）：
+	// 直接拿 filepath.Join 的原生路径（windows 为反斜杠）比对会在 win 上假失败。
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/secret.dat"
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sub := filepath.Join(dir, "sub")
-	deep := filepath.Join(sub, "deep")
+	sub := dir + "/sub"
+	deep := sub + "/deep"
 	if err := os.MkdirAll(deep, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	deepFile := filepath.Join(deep, "probe_key.dat")
+	deepFile := deep + "/probe_key.dat"
 	if err := os.WriteFile(deepFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
