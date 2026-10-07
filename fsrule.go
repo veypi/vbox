@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// fs 规则行解析与编译（自 aic-pod libs/policy + fsauth compileFSRule 合并移植）：
+// fs 规则行解析与编译：
 // 行首效果前缀 + 全域禁写护栏 + 变量展开 + canonical——产出可直接入表的 Rule。
 //
 // 注意：vbox 的 Rule 是纯数据；「裸路径覆盖子树」由 matcher 承担（不再需要
@@ -133,4 +133,57 @@ func CompileFSRules(raws []string, class Class) ([]Rule, error) {
 		}
 	}
 	return out, nil
+}
+
+// IneffectiveRows 返回【永不生效】的行下标：first-wins 下，一旦某条更靠前的
+// rw 行（外层）覆盖了后续 deny/ro 行（内层）的全部匹配路径，内层行永远轮不到
+// 求值。最常见的踩法是把 deny 写在 rw 之后——执行端按 first-wins 放行（Windows
+// 只留一句 "deny ACE skip rw-hole" 日志），使用者很难察觉自己的 deny 形同虚设。
+//
+// 判定保守（宁可漏报不误报），只在能静态确定包含关系时报告：
+//   - 两行模式相同；
+//   - 外层以 /** 结尾：内层等于其前缀或落在其下（** 含零段，故含根目录）；
+//   - 外层无通配元字符 `* ?`（裸路径覆盖子树）：内层落在其子树下。
+//
+// 外层模式自身含通配元字符且非 /** 尾形态时不判定（包含关系不可静态确定）。
+// 编译不因这些行失败——整表仍合法，只是内层永不命中；调用方可在装配配置时
+// 用它提示或拒绝（见 README「规则表」）。
+func IneffectiveRows(rules []Rule) []int {
+	var out []int
+	for i, r := range rules {
+		if r.Effect == EffRW {
+			continue
+		}
+		for j := 0; j < i; j++ {
+			if rules[j].Effect != EffRW {
+				continue
+			}
+			if patternCovers(rules[j].Pattern, r.Pattern) {
+				out = append(out, i)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// patternCovers 报告 outer（rw 行模式）是否覆盖 inner（后续行模式）的全部匹配
+// 路径。两侧先按 CanonicalPattern 归一（与 Match 入口的路径侧同口径），再按
+// MatchPattern 的语义比对：裸路径覆盖子树、/** 含零段、/ 为段边界。
+func patternCovers(outer, inner string) bool {
+	outer = CanonicalPattern(strings.TrimSpace(outer))
+	inner = CanonicalPattern(strings.TrimSpace(inner))
+	if outer == "" || inner == "" {
+		return false
+	}
+	if outer == inner {
+		return true
+	}
+	if base := strings.TrimSuffix(outer, "/**"); base != outer {
+		return inner == base || strings.HasPrefix(inner, base+"/")
+	}
+	if strings.ContainsAny(outer, "*?") {
+		return false // 通配外层：包含关系不能静态断定
+	}
+	return strings.HasPrefix(inner, outer+"/")
 }

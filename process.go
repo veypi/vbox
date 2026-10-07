@@ -54,6 +54,13 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 		return 0, fmt.Errorf("exec: custom argv0 is not supported by this sandbox launcher")
 	}
 	if confined {
+		// 行序陷阱提示：deny/ro 行被上方 rw 行完全覆盖时永不生效（first-wins），
+		// 执行端只会安静地放行——这里给配置作者留一条可寻的日志。
+		if logf != nil {
+			if shadowed := IneffectiveRows(opts.Policy.FS.Rules); len(shadowed) > 0 {
+				logf("sandbox: %d fs rule row(s) shadowed by an earlier rw row (never effective): %v", len(shadowed), shadowed)
+			}
+		}
 		var err error
 		plan, err = planConfined(processSpec(opts, logf))
 		if err != nil {
