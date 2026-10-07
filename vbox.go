@@ -83,6 +83,29 @@ type Rule struct {
 	Pattern string
 	Effect  Effect
 	Class   Class
+	// Resolve 可选：行命中时由回调按本次「路径 + 操作」现算效果，把「随目标
+	// 数量增长的一次性枚举行」换成「一行 + 按需判定」（如云 /skills/{id} 的
+	// 可见性：只查当前这一个 id，不枚举全库）。Handled=false = 回调不表态，
+	// 落回 Effect（静态部分仍可读，诊断/表渲染不受影响）。行序语义不变：前面
+	// 的行仍先命中、且命中本行时不再查后续行。
+	//
+	// 仅进程内匹配（Match/MatchPath/MatchNoFollow）调用回调；OS 级沙箱计划
+	// 只认静态 Effect，带 Resolve 的行交给计划生成会被显式拒绝
+	//（validateProcessPolicy）——动态判定无法下推到 seatbelt/bwrap/ACL。
+	Resolve func(path string, op FileOp) Resolution
+}
+
+// Resolution 是动态行回调（Rule.Resolve）的判定结果。
+type Resolution struct {
+	// Effect 生效效果。
+	Effect Effect
+	// Reason 可选：给调用方的说明（如拒绝原因）。判定不看它，只用于报错/
+	// 日志——静态行的说明由调用方自建，动态行的情形只有回调知道（例如
+	// 「公开包是发布物，不可写且 grant 不可授」与「本人私有包，写需 grant」
+	// 的区别）。
+	Reason string
+	// Handled false = 回调不表态，落回 Rule.Effect。
+	Handled bool
 }
 
 // FileOp 文件操作类别。
@@ -98,6 +121,9 @@ type Decision struct {
 	Allow   bool   // 本操作是否放行
 	Matched int    // 命中行序号（0 起）；-1 = 未命中（兜底生效）
 	Effect  Effect // 生效效果（命中行效果或兜底）
+	// Reason 动态行（Rule.Resolve）给出的说明（拒绝原因等）；静态命中行与
+	// 兜底判定的 Reason 为空，调用方自建文案。
+	Reason string
 }
 
 // FSRuleSet 文件规则集：有序表，从头扫、首命中生效。
@@ -137,9 +163,17 @@ func (s FSRuleSet) MatchNoFollow(path string, op FileOp) Decision {
 // MatchPath evaluates an already normalized path without consulting the host filesystem.
 func (s FSRuleSet) MatchPath(cpath string, op FileOp) Decision {
 	for i, r := range s.Rules {
-		if MatchPattern(r.Pattern, cpath) {
-			return Decision{Allow: effectAllows(r.Effect, op), Matched: i, Effect: r.Effect}
+		if !MatchPattern(r.Pattern, cpath) {
+			continue
 		}
+		eff := r.Effect
+		reason := ""
+		if r.Resolve != nil {
+			if res := r.Resolve(cpath, op); res.Handled {
+				eff, reason = res.Effect, res.Reason
+			}
+		}
+		return Decision{Allow: effectAllows(eff, op), Matched: i, Effect: eff, Reason: reason}
 	}
 	// 未命中：读默认开放；写走 DefaultWrite 兜底（EffDeny|EffRW）。
 	if op == OpRead {

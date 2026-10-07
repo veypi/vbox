@@ -906,6 +906,11 @@ func validateProcessPolicy(spec confineSpec, platform string) error {
 		if r.Pattern == "" || r.Effect > EffRW {
 			return fail("invalid file rule")
 		}
+		// 动态行（Resolve 回调）是进程内判定，OS 后端只能表达静态效果——
+		// 拿 Effect 当终局会与真实判定不一致（可能更宽松），必须拒启。
+		if r.Resolve != nil {
+			return fail("dynamic (resolve) file rule is process-local only: " + r.Pattern)
+		}
 	}
 	if spec.fsRules.DefaultWrite != EffDeny && spec.fsRules.DefaultWrite != EffRW {
 		return fail("invalid default file permission")

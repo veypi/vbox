@@ -2,6 +2,23 @@
 
 版本号见 [VERSION](VERSION)，遵循 SemVer：破坏性变更进位 minor。
 
+## 0.3.0 — 2026-10-08
+
+### 新增
+
+- **规则行动态判定 `Rule.Resolve`（配 `Resolution` / `Decision.Reason`）**：规则行可带
+  `Resolve func(path string, op FileOp) Resolution` 回调，在本行命中时按「路径 + 操作」
+  现算效果——把「随目标数量增长的一次性枚举行」换成「一行 + 按需判定」（典型场景：云
+  `/skills/{id}` 的可见性，只查当前这一个 id，不枚举全库）。行序语义不变：前面的行仍
+  先命中、命中本行时不再查后续行；回调不表态（`Handled=false`）落回静态 `Effect`。
+  `Resolution.Reason` 经 `Decision.Reason` 回传给调用方做报错文案（静态命中行与兜底
+  判定的 `Reason` 为空，由调用方自建文案）。
+- **OS 级沙箱计划拒启动态行（fail-closed）**：`validateProcessPolicy`（darwin / linux /
+  windows 共用）遇到带 `Resolve` 的行直接拒绝——动态判定无法下推到 seatbelt / bwrap /
+  ACL，拿静态 `Effect` 当终局会与真实判定不一致（可能更宽松）。
+- **测试**：动态行的行序与 `Reason` 传递、回调不表态落回静态效果、OS 计划拒绝动态行
+  （同一张表去掉回调即合法）。
+
 ## 0.2.0 — 2026-10-07
 
 ### 独立使用收敛（2026-10-07）

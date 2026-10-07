@@ -1,10 +1,92 @@
 package vbox
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// ---- 动态行（Resolve：按路径现算） ----
+
+// 动态行：行序照旧（前面行先命中），命中本行时由回调按「路径 + 操作」定效果；
+// 回调不表态（ok=false）落回静态 Effect。
+func TestFSRuleSetDynamicRowResolve(t *testing.T) {
+	t.Parallel()
+	var calls []string
+	set := NewFSRuleSet([]Rule{
+		{Pattern: "/granted", Effect: EffRW, Class: ClassTemp},
+		{Pattern: "/skills", Effect: EffDeny, Class: ClassCfg, Resolve: func(path string, op FileOp) Resolution {
+			calls = append(calls, path)
+			if strings.HasPrefix(path, "/skills/mine") {
+				if op == OpRead {
+					return Resolution{Handled: true, Effect: EffRO}
+				}
+				return Resolution{Handled: true, Effect: EffDeny, Reason: "本人私有包：写需 grant"}
+			}
+			if strings.HasPrefix(path, "/skills/unsure") {
+				return Resolution{}
+			}
+			return Resolution{Handled: true, Effect: EffDeny, Reason: "不可见"}
+		}},
+	}, EffDeny)
+
+	// 前序行先命中：动态行的回调根本不被调用。
+	if d := set.Match("/granted/sk/x", OpWrite); !d.Allow || d.Matched != 0 {
+		t.Fatalf("prior row must win: %+v", d)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("resolver must not run when an earlier row matches: %v", calls)
+	}
+	// 命中动态行：回调定效果（读 ro 放行、写 deny）。
+	if d := set.Match("/skills/mine/SKILL.md", OpRead); !d.Allow || d.Effect != EffRO || d.Matched != 1 {
+		t.Fatalf("dynamic ro read = %+v", d)
+	}
+	// 回调的 Reason 随判定返回（调用方拿它做报错文案；静态行/兜底为空）。
+	if d := set.Match("/skills/mine/SKILL.md", OpWrite); d.Allow || d.Reason != "本人私有包：写需 grant" {
+		t.Fatalf("dynamic write must deny with reason: %+v", d)
+	}
+	if d := set.Match("/skills/other/x", OpRead); d.Allow || d.Reason != "不可见" {
+		t.Fatalf("dynamic deny reason = %+v", d)
+	}
+	// 回调不表态（Handled=false）→ 落回静态 Effect（deny），Reason 为空。
+	if d := set.Match("/skills/unsure/x", OpRead); d.Allow || d.Effect != EffDeny || d.Reason != "" {
+		t.Fatalf("fallback to static effect = %+v", d)
+	}
+	// 静态行/兜底不产生 Reason。
+	if d := set.Match("/granted/sk/x", OpRead); d.Reason != "" {
+		t.Fatalf("static row must not carry reason: %+v", d)
+	}
+	// 子路径仍覆盖（裸路径覆盖子树），只查当前这一个路径。
+	if len(calls) == 0 || calls[len(calls)-1] != "/skills/unsure/x" {
+		t.Fatalf("resolver got %v, want last = /skills/unsure/x", calls)
+	}
+}
+
+// 动态行只属进程内匹配：OS 级沙箱计划必须拒启（拿静态 Effect 当终局会
+// 与真实判定不一致，可能更宽松）。
+func TestValidateProcessPolicyRejectsDynamicRows(t *testing.T) {
+	t.Parallel()
+	spec := confineSpec{fsRules: NewFSRuleSet([]Rule{
+		{Pattern: "/skills", Effect: EffDeny, Class: ClassCfg, Resolve: func(string, FileOp) Resolution {
+			return Resolution{Handled: true, Effect: EffRO}
+		}},
+	}, EffDeny)}
+	err := validateProcessPolicy(spec, "darwin")
+	if err == nil {
+		t.Fatal("dynamic row must be rejected by OS backends")
+	}
+	var denied *DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("err = %v, want DeniedError（fail-closed）", err)
+	}
+	// 同一张表去掉回调即合法。
+	spec.fsRules = NewFSRuleSet([]Rule{{Pattern: "/skills", Effect: EffDeny, Class: ClassCfg}}, EffDeny)
+	if err := validateProcessPolicy(spec, "darwin"); err != nil {
+		t.Fatalf("static table must pass: %v", err)
+	}
+}
 
 // ---- first-wins 行序（语义反转的核心） ----
 
