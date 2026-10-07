@@ -1,45 +1,52 @@
 # vbox
 
-**原生子进程沙箱库**：有序规则表 + 纯判定 + OS 落地 + 进程托管。用来在真实宿主上
-启动子进程，并把「能不能读 / 写 / 连」表达成一张有序规则表，由内核机制兜底。
+**Go 原生子进程沙箱。** 在真实宿主上启动一个子进程，它「能读什么、能写什么、能连哪里」由
+**一张有序规则表**表达，并交给内核兜底执行。
 
-MIT 许可（[LICENSE](LICENSE)）。
+**中文** | [English](README.en.md)
 
-## 规则语义
-
-单一有序规则表，**从前向后扫描、首命中生效**（first-wins）；新规则插表头。行为完全
-由行序决定，没有「谁压谁」的特殊规则。行首是效果前缀：
-
-```text
-ro:~/.ssh/known_hosts      # 只读
-deny:**/.ssh/**            # 读写双拒——上面那行先命中，所以 known_hosts 仍是例外
-rw:/srv/work/**            # 读写
+```go
+code, err := mgr.RunProcess(ctx, vbox.StartOptions{
+	Exec:    []string{"/usr/bin/curl", "-sS", "https://api.example.com/x"},
+	Workdir: "/srv/work",
+	Policy:  policy, // 有序 fs/net 规则快照
+}, nil, os.Stdout, os.Stderr)
 ```
 
-文件与网络各一域（`FSRuleSet` / `NetRuleSet`）；网络域用 `allow:` / `deny:` 加
-`host:port`（端口可为 `*`）。**审批策略、配置解析、授权生命周期都不在本库**——调用方
-每次调用编译一份快照传进来。
+vbox 只做一件事：拿到**你**给的规则快照，让操作系统为一个子进程落实它。配置解析、审批、
+授权生命周期、审计都在调用方——vbox 不读你的配置，也不替你决定策略。
 
-`Class`（`ClassTemp` / `ClassCfg` / `ClassBuiltin` / `ClassConvenience`）只用于调用方
-把不同来源的行拼成稳定顺序（temp grant → 配置 → 出厂内建 → 便利根）；判定本身不看
-`Class`。
+## 它能给你什么
 
-## 三段式接口
+- **一张有序规则表，首命中生效**：行序就是策略，没有覆盖层、没有「更具体的规则胜」；
+  新规则插表头。
+- **内核执行，不是模拟**：macOS Seatbelt（SBPL）、Linux bubblewrap、Windows 受限令牌 +
+  显式拒绝 ACE。纯 Go、无 cgo（只依赖 `golang.org/x/sys` 与 `x/text`）。
+- **fail-closed**：本平台无法表达的规则在启动前就被拒绝；没有可用沙箱后端时报错且
+  **命令不执行**——绝不静默裸跑。
+- **自带进程托管**：`context` 取消整棵进程树、输出捕获（文本或原始字节）、环境清洗、
+  资源限制、可选的阶段计时日志。
+- **只判定不启动**：同一张表能当纯函数回答「这个进程能不能写 `/srv/work/out.txt`」，
+  便于预检与测试。
 
-1. **规则模型**（`fsrule.go` / `net.go`）：效果、模式、目标条目与解析。
-2. **编译**（`CompileFSRules` / `CompileNetRules` / `NewFSRuleSet`）：把规则变成可执行
-   快照，模式归一（符号链接前缀展开）在此完成。**fail-closed**——本平台无法表达的规则
-   在启动前就被拒绝，不会静默降级成放行。
-3. **执行**（`Manager.RunProcess`）：沙箱落地、进程托管、输出捕获、取消与资源限制。
+## 安装
+
+```sh
+go get github.com/veypi/vbox
+```
+
+所需 Go 版本见 [go.mod](go.mod)。
+
+## 快速开始
 
 ```go
 rules, err := vbox.CompileFSRules([]string{
-	"ro:~/.ssh/known_hosts",
-	"deny:**/.ssh/**",
-	"rw:/srv/work/**",
+	"ro:~/.ssh/known_hosts", // 只读
+	"deny:**/.ssh/**",       // 读写双拒（上面那行已把 known_hosts 变成例外）
+	"rw:/srv/work/**",       // 读写
 }, vbox.ClassCfg)
 if err != nil {
-	return err // 规则在本平台不可表达：拒绝，不放行
+	return err // 本平台不可表达：拒绝，而不是放宽
 }
 
 policy := vbox.Policy{
@@ -64,15 +71,56 @@ code, err := mgr.RunProcess(ctx, vbox.StartOptions{
 
 ```go
 d := policy.FS.Match("/srv/work/out.txt", vbox.OpWrite)
-// d.Allow / d.Matched（命中行号，-1 = 走兜底）/ d.Effect
+// d.Allow、d.Matched（命中行号，-1 = 走兜底）、d.Effect
 
 allow := policy.Net.Match("api.example.com:443")
 ```
 
-`Match` 跟随末段符号链接（open/connect 语义），`MatchNoFollow` 用于 `unlink`/`rename`
+`Match` 跟随末段符号链接（open/connect 语义）；`MatchNoFollow` 用于 `unlink`/`rename`
 （作用于链接本身）。`MatchPath` 接收已归一化的路径，不碰宿主文件系统。
 
-## 平台落地
+## 规则表
+
+三种效果前缀：
+
+| 前缀 | 含义 |
+| --- | --- |
+| `deny:` | 读写双拒 |
+| `ro:` | 读放行、写拒 |
+| `rw:` | 读写放行 |
+
+模式：裸路径覆盖整棵子树（`/srv/work` 覆盖 `/srv/work/a/b`）；`*` 匹配段内任意字符、
+`?` 匹配单字符、`**` 匹配零或多段（所以 `/etc/ssh/**` 连 `/etc/ssh` 自身也匹配）。
+表从头扫到尾，首命中生效。
+
+`Class`（`ClassTemp` / `ClassCfg` / `ClassBuiltin` / `ClassConvenience`）只用于调用方把
+不同来源的行拼成稳定顺序（temp grant → 配置 → 出厂内建 → 便利根）；判定本身不看 `Class`。
+
+### 两个容易踩的点
+
+**行序陷阱：被压住的行是安静的。** 如果靠前的 `rw:` 行已经覆盖了靠后的 `deny:` / `ro:`
+目标，后者永远轮不到求值，执行端会直接放行。装配期用 `IneffectiveRows(rules)` 拿到
+「被上方 `rw` 行完全覆盖」的行下标——判定保守（只报能静态证明的包含关系），编译本身
+不因死行失败。注入 `Manager.SetLogf` 时，执行路径也会打一条
+`shadowed by an earlier rw row` 日志。
+
+**规则表请用 `NewFSRuleSet` / `CompileFSRules` 构造，不要用结构体字面量。** 字面构造的
+`FSRuleSet` 必须自带 canonical 模式：`Match` 入口只归一化**路径**侧，模式用了别的拼写就会
+两侧错位、行形同虚设——在 Windows 上这会把可写根误判成只读目标，子进程连自己的工作区都
+写不了。两个构造入口都会替你归一模式（`CompileFSRules` 另外做变量展开，并把本机无法
+执行的规则直接拒绝）。
+
+## 平台支持
+
+| 平台 | 状态 |
+| --- | --- |
+| macOS（arm64 / amd64） | **支持**：Seatbelt 后端；CI 构建 + 全量测试 |
+| Linux（amd64 / arm64） | **支持**：bubblewrap 后端（需 `bwrap` 与可用 user namespace）；CI 构建 + 全量测试 |
+| Windows（amd64 / arm64） | **支持**：受限令牌 + 显式拒绝 ACE；CI 构建，ACL 用例需实机 |
+| freebsd / netbsd / openbsd / dragonfly / solaris / illumos / aix / android | 未承诺：可编译，无内核沙箱后端（fail-closed），未做行为验证 |
+| plan9 / js / wasip1 | **不支持**：缺进程/信号/沙箱语义，构建在包边界显式失败 |
+
+未列出的平台按「未承诺」处理。同一张表在各平台如何落地：
 
 | 平台 | 机制 | 说明 |
 | --- | --- | --- |
@@ -81,10 +129,9 @@ allow := policy.Net.Match("api.example.com:443")
 | Windows | 受限令牌 + 显式拒绝 ACE | 句柄版 ACL（`\\?\` 长路径、`Get/SetSecurityInfo`）；终局 `rw` 目标跳过 ACE，`deny` 与独立 `ro` 行落拒绝 ACE；嵌套只读洞只在工具层生效 |
 | 其他 | 无内核沙箱 | 明确报错，不静默裸跑 |
 
-Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件
-（`{UserConfigDir}/aic/sandbox/deny_acl_state.json`），并使用确定性派生的能力 SID——
-因此 ACE 跨调用/重启稳定，宿主机其他进程不受影响。相关规则在 `sandbox_windows.go`
-中集中说明。
+Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件（默认
+`{UserConfigDir}/vbox/sandbox/deny_acl_state.json`，可用 `Manager.SetStateDir` 指定），
+并使用确定性派生的能力 SID —— 因此 ACE 跨调用/重启稳定，宿主机其他进程不受影响。
 
 ## 进程托管
 
@@ -97,13 +144,15 @@ Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件
   供协议管道与二进制命令使用；默认文本模式只刷新自己创建的包装器，不关闭调用方的 writer。
 - **`Workdir`**：只设 cwd，不授予目录权限。
 - **取消与期限**：全部由 `ctx` 承担；取消会终止整个进程树（Windows 走 Job Object）。
-- **日志**：`SetLogf` 注入沙箱/执行阶段计时日志，不注入则全链静默。
+- **日志**：`SetLogf` 注入沙箱/执行阶段计时日志（含上面那条死行提示）；不注入则全链静默。
+- **状态目录**：`SetStateDir(dir)` 指定持久状态目录（Windows deny ACE 对账状态文件；
+  默认 `{UserConfigDir}/vbox/sandbox`）。
 
-## 与调用方的关系
+## 不在这里的东西
 
 配置解析、默认规则源、会话授权、grant 生命周期与审批都不在本库；vbox 只接收快照、
 做判定并落地。参考集成：[aic-pod](https://github.com/veypi/aic-pod) 的 `libs/host`
-负责配置与授权，每次调用编译快照交给 vbox。
+作为外部使用者负责配置与授权，每次调用编译快照交给 vbox。
 
 ## 测试
 
@@ -112,10 +161,12 @@ go test ./...
 go vet ./...
 ```
 
-沙箱用例依赖真实平台能力：macOS 需要 Seatbelt、Linux 需要 bwrap/user namespace、
-Windows 的 ACL 用例需要真实令牌与句柄；跨平台编译通过不等于实机行为已验证。
+沙箱用例依赖真实平台能力：macOS 需要 Seatbelt、Linux 需要 bwrap + user namespace、
+Windows 的 ACL 用例需要真实令牌与对象句柄。缺少能力时用例会**带原因自己跳过**——
+跨平台编译通过不等于实机行为已验证。
 
-## 版本与许可
+## 文档、版本与许可
 
-- 当前版本见 [VERSION](VERSION)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+- 行为变更见 [CHANGELOG.md](CHANGELOG.md)；当前版本见 [VERSION](VERSION)。
+- 贡献者与 AI 代理须知（含不可破坏的契约）见 [AGENTS.md](AGENTS.md)。
 - MIT（[LICENSE](LICENSE)）。

@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt -l 必须为空
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化（本地跑 gofmt -w）："
+            echo "$out"
+            exit 1
+          fi
+
+  test:
+    name: vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./...
+      - run: go test ./...
+
+  build-matrix:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          # 未承诺平台：只保证能编译（不支持平台见 README「平台支持」）
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: openbsd, goarch: amd64 }
+          - { goos: solaris, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go build ./...
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
