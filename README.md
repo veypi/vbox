@@ -133,6 +133,14 @@ Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件（默认
 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`，可用 `Manager.SetStateDir` 指定），
 并使用确定性派生的能力 SID —— 因此 ACE 跨调用/重启稳定，宿主机其他进程不受影响。
 
+**可写根授不上 ACL 只降级该根，不中断 exec。** 一个可写根可能授权时还不存在（spawn
+时由存在性过滤），也可能存在却授不上——典型是属主为 `Administrators` / `SYSTEM` 而
+当前用户只有 `Modify`（Modify 不含改安全描述符的权限）。此时该根在沙箱内只读，日志
+按目录告警一次（固定标记 `write-root unavailable in sandbox`），同一次执行的其余可写
+根与进程本身照常；每次调用仍会重试授权，ACL 修好或目录重建后自动恢复可写。授权侧
+可以在授权那一刻用 `CheckFSGrantTarget(abs)`（要求原生态路径）预判同一件事。
+反方向不降级：`deny` 目标无法落实时仍然拒绝执行——沙箱绝不允许比策略更宽。
+
 ## 进程托管
 
 `RunProcess` 是唯一入口（`Manager.Close` 统一终止在跑进程）：

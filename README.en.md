@@ -142,6 +142,18 @@ On Windows, idempotent deny-ACE bookkeeping is kept in a state file (default
 and capability SIDs are derived deterministically — so ACEs stay stable across calls and
 restarts and no other process on the host is affected.
 
+**A write root that cannot be granted an ACL only degrades that root — it never sinks the
+whole exec.** The directory may not exist yet (filtered at spawn time), or it may exist yet be
+un-grantable — typically owned by `Administrators`/`SYSTEM` while the current user only holds
+`Modify`, which excludes changing the security descriptor. Such a root is read-only inside the
+sandbox and is reported once per directory in the log (stable marker
+`write-root unavailable in sandbox`); the remaining writable roots and the exec itself are
+unaffected. Granting is retried on every call, so fixing the ACL (or recreating the directory)
+restores writability automatically. Callers can predict the same thing at grant time with
+`CheckFSGrantTarget(abs)` (native path required). The opposite direction never degrades: a
+`deny` target that cannot be enforced still aborts the run — the sandbox must never end up
+wider than the policy.
+
 ## Process management
 
 `RunProcess` is the only entry point; `Manager.Close` terminates every child still running.

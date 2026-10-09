@@ -815,6 +815,62 @@ func stringsJoin(forms []string) string {
 	return strings.Join(forms, " ")
 }
 
+// grantRootSIDs 逐根独立授权：任一目录授不上只降级该根（该根在沙箱内只读），
+// 不中断整个 exec。sidOf/grant 是平台细节（Windows = 能力 SID + ACL 授权），
+// 逻辑本身（逐根重试、去重、失败只告警一次、不给负缓存）与平台无关，因此放在
+// 本文件——无 Windows 的机器与 CI 也能覆盖这段语义。
+//
+// 判据：写白名单的失败方向是「更严」——能力 SID 少一个只让写更多被拒
+// （restricting 列表只收不放）；反向的「更宽」失败（deny ACE 落不下、令牌/
+// 私有临时目录不可用）在调用方仍然 fatal。把一个本地目录问题放大成「所有 exec
+// 全废」是过度惩罚，也让可查的问题变成不可查。
+//
+// 每次调用都仍尝试授权（不引入负缓存）：目录被删重建、或 ACL 事后修好时自动
+// 恢复；日志按目录去重，避免热路径刷屏。
+func grantRootSIDs[T any](dirs []string, sidOf func(string) (T, error),
+	grant func(string, T) error, logf func(string, ...any)) []T {
+	var sids []T
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		sid, err := sidOf(d)
+		if err == nil {
+			err = grant(d, sid)
+		}
+		if err != nil {
+			logWriteRootUnavailable(d, err, logf)
+			continue
+		}
+		sids = append(sids, sid)
+	}
+	return sids
+}
+
+// logWriteRootUnavailable 记录一个授不上/不可授的可写根（每个目录只告警一次）。
+// 标记固定，便于现场按 "write-root unavailable in sandbox" 检索——降级是静默
+// 的，可发现性只能靠这条日志与 grant fs / grant status 的提示。
+var (
+	writeRootWarnMu   sync.Mutex
+	writeRootWarnSeen = map[string]bool{}
+)
+
+func logWriteRootUnavailable(dir string, err error, logf func(string, ...any)) {
+	if logf == nil {
+		return
+	}
+	writeRootWarnMu.Lock()
+	if writeRootWarnSeen[dir] {
+		writeRootWarnMu.Unlock()
+		return
+	}
+	writeRootWarnSeen[dir] = true
+	writeRootWarnMu.Unlock()
+	logf("vbox: write-root unavailable in sandbox: %s — writes under it will be denied inside the sandbox: %v", dir, err)
+}
+
 // existingDirs 过滤掉空串与不存在的目录（bwrap --bind / windows grantDirWrite
 // 都要求源存在；seatbelt subpath 不强制，统一过滤保持三端一致）。
 func existingDirs(dirs ...string) []string {

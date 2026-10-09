@@ -902,3 +902,112 @@ func TestWindowsACELongPath(t *testing.T) {
 		}
 	})
 }
+
+// ---- 可写根降级（2026-10-10：管理员属主目录 grant fs 打死全部 exec）----
+//
+// 判据：写白名单的失败方向是「更严」（少一个能力 SID 只让写更多被拒），
+// 所以逐根降级；收紧方向（deny 不可表达）仍然拒绝执行——见
+// TestPlanConfinedDenyFailureStaysFatal。
+//
+// grantRootSIDs 的纯逻辑用例（假 SID 类型，跨平台可跑）在
+// sandbox_grantroots_test.go；本文件只放需要真实令牌/ACL 的用例。
+
+// 端到端（注入授权失败）：授不上的根不再打死整条 exec，其余可写根照常可写。
+func TestPlanConfinedDegradesOnUngrantableRoot(t *testing.T) {
+	resetWriteRootWarnState()
+	ws, other := t.TempDir(), t.TempDir()
+	rows := canonRules([]Rule{{Pattern: ws, Effect: EffRW}, {Pattern: other, Effect: EffRW}})
+	bad := pathToOS(Canonical(other))
+	orig := grantWriteRoot
+	defer func() { grantWriteRoot = orig }()
+	var logs []string
+	grantWriteRoot = func(dir string, sid *windows.SID) error {
+		if dir == bad {
+			return syscall.Errno(5)
+		}
+		return orig(dir, sid)
+	}
+	spec := confineSpec{
+		workdir:  ws,
+		argv:     writeCmd(filepath.Join(ws, "ok.txt")),
+		fsRules:  FSRuleSet{Rules: rows},
+		netRules: NetRuleSet{Default: true},
+		logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+	}
+	plan, err := planConfined(spec)
+	if err != nil {
+		t.Fatalf("an ungrantable write root must not abort the plan: %v", err)
+	}
+	out, exit := runWithPlan(t, plan, plan.argv, ws)
+	if exit != 0 {
+		t.Fatalf("the grantable root must stay writable: exit=%d out=%q", exit, out)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "ok.txt")); err != nil {
+		t.Fatalf("workspace write missing: %v (out=%q)", err, out)
+	}
+	warned := false
+	for _, l := range logs {
+		if strings.Contains(l, "write-root unavailable in sandbox") && strings.Contains(l, bad) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("expected a warning naming %s, got %q", bad, logs)
+	}
+}
+
+// 被降级的根在沙箱内确实只读：降级 = 更严，不是静默放权。
+func TestPlanConfinedUngrantableRootIsReadOnly(t *testing.T) {
+	resetWriteRootWarnState()
+	other := t.TempDir()
+	target := filepath.Join(other, "denied.txt")
+	orig := grantWriteRoot
+	defer func() { grantWriteRoot = orig }()
+	grantWriteRoot = func(string, *windows.SID) error { return syscall.Errno(5) }
+	plan, err := planConfined(confineSpec{
+		workdir:  other,
+		argv:     writeCmd(target),
+		fsRules:  FSRuleSet{Rules: canonRules([]Rule{{Pattern: other, Effect: EffRW}})},
+		netRules: NetRuleSet{Default: true},
+	})
+	if err != nil {
+		t.Fatalf("planConfined: %v", err)
+	}
+	if out, exit := runWithPlan(t, plan, plan.argv, other); exit == 0 {
+		t.Fatalf("degraded root must be read-only inside the sandbox: out=%q", out)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("degraded root must not be writable")
+	}
+}
+
+// deny 侧失败仍 fatal（收紧方向不得降级）：不可实例化的 deny 形态拒绝执行。
+func TestPlanConfinedDenyFailureStaysFatal(t *testing.T) {
+	spec := confineSpec{
+		workdir:  t.TempDir(),
+		argv:     []string{"cmd", "/c", "echo ok"},
+		fsRules:  FSRuleSet{Rules: []Rule{{Pattern: "/*/secret", Effect: EffDeny}}},
+		netRules: NetRuleSet{Default: true},
+	}
+	if _, err := planConfined(spec); err == nil || !strings.Contains(err.Error(), "cannot enforce") {
+		t.Fatalf("uninstantiable deny pattern must abort the plan: %v", err)
+	}
+}
+
+// 前置探测（CheckFSGrantTarget 三态）：路径不存在 / 非目录不阻断授权；
+// 自建目录应当可授。
+func TestCheckFSGrantTargetStates(t *testing.T) {
+	if err := CheckFSGrantTarget(filepath.Join(t.TempDir(), "not-yet")); err != nil {
+		t.Fatalf("missing path must not block a grant: %v", err)
+	}
+	file := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckFSGrantTarget(file); err != nil {
+		t.Fatalf("non-directory must not block a grant: %v", err)
+	}
+	if err := CheckFSGrantTarget(t.TempDir()); err != nil {
+		t.Fatalf("user-owned directory must be grantable: %v", err)
+	}
+}

@@ -27,6 +27,15 @@ func probeBackend() sandboxBackend {
 	return backendSeatbelt
 }
 
+// CheckFSGrantTarget（darwin）：恒 nil——seatbelt 按路径 profile 放行可写根，
+// unix 后端没有「能不能授上写权限」这一前置条件（不铸 ACL）。
+//
+// 已知不对称：unix 上给一个当前用户不可写的目录 grant fs 同样是空授权（工具
+// 层与子进程都写不了），但判据与 Windows 不同——unix 上不存在「能改 ACL 就能
+// 在沙箱内写」的等价权限，且「目录不可写、其中文件可写」的授权仍有意义
+// （改文件内容不需要目录写权限），故不在此做硬判定。
+func CheckFSGrantTarget(string) error { return nil }
+
 // planConfined（darwin）：sandbox-exec argv 包装 + sh ulimit 资源限制，无令牌。
 // Seatbelt（SBPL）不支持资源限制，用 confineRlimits 包一层 /bin/sh（
 // RLIMIT 跨 exec 继承，子进程只能降低不能提高；ulimit 失败即 fail-closed）。

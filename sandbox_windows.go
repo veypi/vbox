@@ -14,6 +14,11 @@
 //   - 工作区：standing ACE，幂等授权——每次调用先检查 DACL 是否已有该
 //     能力 SID 的完全访问 ACE，有则跳过（不产生重复 ACE）；目录被删重建
 //     后 ACE 消失，下次调用自动重新授权（无进程级缓存，无陈旧状态）
+//   - 可写根降级：某个可写根授不上 ACL（典型：属主是 Administrators/SYSTEM，
+//     当前用户只有 Modify——Modify 不含改安全描述符的权限）时只降级该根：
+//     该根在沙箱内写被拒，日志按目录告警一次（标记
+//     "write-root unavailable in sandbox"）；其余可写根照常，exec 不中断
+//     （判据见 grantRootSIDs）
 //   - 私有临时目录：per-call 随机创建 + 随机 SID，进程结束后删除目录
 //     （ACE 随目录消失，无需显式撤销）
 //   - read-only：restricting list 无能力 SID → 除 Everyone 可写对象外全部
@@ -385,6 +390,44 @@ func aclHasFullGrant(acl *windows.ACL, sid *windows.SID) (bool, error) {
 	return false, nil
 }
 
+// CheckFSGrantTarget 判断该目录能否在沙箱内被授为可写根：Windows 后端的授权
+// 动作是写 DACL（aclWriteDACL 以 READ_CONTROL|WRITE_DAC 开对象），这里以同源
+// 试开做前置探测——无副作用，且与真实授予同一条权限判据。abs 必须是原生态
+// 路径（HostPathToOS 之后）；非原生态拼写在 Windows 上 Stat 失败，会被当成
+// 「路径不存在」而返回 nil。
+//
+// 三态契约（调用方据此决定「拒绝授权 / 授权并警告」）：
+//   - nil：路径不存在或非目录（授权本身合法，spawn 时由 existingDirs 过滤），
+//     或存在且当前用户可写 DACL（沙箱内可授）；
+//   - 非 nil：存在但当前用户无 WRITE_DAC（典型：属主是 Administrators/SYSTEM，
+//     当前用户只有 Modify——Modify 不含改安全描述符的权限）。此时该目录无法
+//     在沙箱内成为可写根（子进程写被拒），但进程内 fs 工具层仍可用。
+func CheckFSGrantTarget(abs string) error {
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return nil
+	}
+	h, err := aclOpenObject(abs, windows.READ_CONTROL|windows.WRITE_DAC)
+	if err != nil {
+		return err
+	}
+	return windows.CloseHandle(h)
+}
+
+// grantWriteRoot 是 planConfined 给可写根授权时的注入点（默认 grantDirWrite）：
+// 测试用它模拟「该目录授不上」的真实场景，而不必在系统目录上留下 ACE。私有
+// 临时目录的授权不经过它（那是本进程自建的目录，失败仍 fatal）。
+var grantWriteRoot = grantDirWrite
+
+// grantWritableRoots 把可写根接到共享的逐根降级逻辑上（grantRootSIDs，见
+// sandbox.go——逻辑与平台无关，只有能力 SID 派生与 ACL 授予是本平台细节）。
+func grantWritableRoots(dirs []string, grant func(string, *windows.SID) error,
+	logf func(string, ...any)) []*windows.SID {
+	return grantRootSIDs(dirs,
+		func(d string) (*windows.SID, error) { return capabilitySID("ws", d) },
+		grant, logf)
+}
+
 // capabilitySID 派生确定性能力 SID（S-1-4-<a>-<b>，自路径哈希）：
 // 同路径（同命名空间）恒得同一 SID，跨进程稳定。
 func capabilitySID(ns, path string) (*windows.SID, error) {
@@ -460,20 +503,11 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	}
 	cleanup := func() {}
 
-	// 可写区授权（workspace-write profile 由 rules 派生，数字等级已删除）。
+	// 可写区授权（workspace-write profile 由 rules 派生，数字等级已删除）：
+	// 逐根降级——授不上的根在沙箱内只读，不影响本次 exec 的其余能力。
 	{
 		dirs := existingDirs(writable...)
-		for _, d := range dirs {
-			sid, err := capabilitySID("ws", d)
-			if err != nil {
-				return launchPlan{}, fmt.Errorf("sandbox: workspace sid: %w", err)
-			}
-			// 幂等授权：已有 ACE 跳过，目录重建后自动补授
-			if err := grantDirWrite(d, sid); err != nil {
-				return launchPlan{}, fmt.Errorf("sandbox: grant workspace %s: %w", d, err)
-			}
-			extraSids = append(extraSids, sid)
-		}
+		extraSids = append(extraSids, grantWritableRoots(dirs, grantWriteRoot, logf)...)
 		grantD = mark()
 
 		// per-call 私有临时目录：随机路径 + 随机 SID，进程结束后删除

@@ -2,6 +2,35 @@
 
 版本号见 [VERSION](VERSION)，遵循 SemVer：破坏性变更进位 minor。
 
+## 0.3.1 — 2026-10-10
+
+### 修复
+
+- **可写根授不上 ACL 不再打死整条 exec（Windows）**：`planConfined` 原先逐根调
+  `grantDirWrite`，任一失败即 `return` 整个 plan——一个合法但事后方知授不上的目录
+  （典型：`C:\models\llama` 属主是 `BUILTIN\Administrators`，当前用户只有
+  `Authenticated Users:(M)`；Modify 不含 WRITE_DAC）会让**所有** exec 失败，而错误
+  只说得出「grant workspace <dir>」，看不出是哪一环。现在改为逐根独立授权
+  （`grantWritableRoots`）：授不上的根只降级——该根在沙箱内写被拒（失败方向恒为
+  更严），日志按目录告警一次（固定标记 `write-root unavailable in sandbox`），
+  其余可写根与本次 exec 照常。每次调用仍重试授权（不引入负缓存），目录被删重建
+  或 ACL 事后修好后自动恢复可写。反方向不降级：`deny` ACE、受限令牌、私有临时
+  目录等「更宽」侧的失败仍然 fatal。
+- **新增 `CheckFSGrantTarget(abs)`**：授权侧前置探测。Windows 用
+  `READ_CONTROL|WRITE_DAC` 试开对象（与真实授权同一条权限判据，无副作用）；
+  不存在/非目录与「可授」都返回 nil，只有「存在但当前用户无 WRITE_DAC」返回错误
+  ——调用方可在 `grant` 那一刻就告知，而不必等到下一次 spawn。其余平台恒 nil
+  （unix 在挂载/profile 层落实可写根，不存在「能不能授上」这一前置条件；已知
+  不对称见函数注释）。
+
+### 测试
+
+- 新增用例：`grantRootSIDs` 的纯逻辑（授不上一个根不丢其余根且只告警一次、全部
+  失败不报错、SID 派生失败只跳该根、同路径只授权一次）——逻辑与平台无关，放共享
+  文件 `sandbox_grantroots_test.go`（sandbox.go 的 `grantRootSIDs`），macOS/Linux/CI
+  都能跑；Windows 专有：注入授权失败后端到端存活（其余可写根仍可写）、被降级的根在
+  沙箱内确实只读、`deny` 不可实例化仍拒绝执行、`CheckFSGrantTarget` 三态。
+
 ## 0.3.0 — 2026-10-08
 
 ### 新增
