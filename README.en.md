@@ -56,7 +56,7 @@ policy := vbox.Policy{
 	FS: vbox.NewFSRuleSet(rules, vbox.EffDeny), // unmatched writes denied (reads stay open)
 	Net: vbox.NetRuleSet{
 		Rules:   []vbox.NetRule{{HostPort: "api.example.com:443", Allow: true}},
-		Default: false,
+		Default: false, // deny posture; per-row landing semantics in "Network rule enforcement"
 	},
 }
 
@@ -136,6 +136,36 @@ Anything not listed counts as "not promised". How each backend maps the same tab
 | Linux | bubblewrap | Whole-machine read-only view plus write bindings for granted roots; `ro`/`rw` holes are re-added in table order; requires `bwrap` and user namespaces |
 | Windows | Restricted token + deny ACEs | Handle-based ACL (`\\?\` long paths, `Get/SetSecurityInfo`); targets that resolve to `rw` get no ACE, `deny` and standalone `ro` rows get a deny ACE; nested read-only holes exist only at the tool layer |
 | Other | No kernel sandbox | Explicit error, never a silent unsandboxed run |
+
+### Network rule enforcement
+
+Network rules land differently from filesystem rules — posture and per-row rules are
+separate:
+
+| Platform | Posture (`Default`) | Per-row rules |
+| --- | --- | --- |
+| macOS | Kernel-enforced (deny = full block) | **Loopback only** (Seatbelt remote tcp); any other deny row aborts the launch |
+| Linux | Kernel-enforced (deny = `--unshare-net`; the new netns leaves loopback unconfigured, so even loopback is unreachable) | Not expressible |
+| Windows | open only; the deny posture aborts the launch outright | Not expressible |
+
+Rows the kernel cannot express are handled by direction — **the sandbox never ends up
+wider than the policy**:
+
+- **deny rows**: dropping one would widen the sandbox, so the launch is refused
+  (fail-closed).
+- **allow rows**: under the deny posture they are *absorbed* — the target is already
+  unreachable in that sandbox, so skipping the row is strictly narrower and is logged,
+  not refused. Under the open posture they are no-ops (nothing is tightened without
+  deny rows).
+- **`tool:` prefix**: `tool:deny:169.254.169.254:*` declares a row enforced only by
+  the caller's tool layer (an in-process HTTP/MCP client, etc.); kernel enforcement
+  and the enforceability check skip it entirely. `Match`/`Resolve` ignore `ToolOnly`,
+  so the tool layer still honors the row.
+
+Use `CheckNetPolicy(platform, rules)` to pre-flight a table: it classifies every row
+as landed / absorbed (with a `Noop` flag separating "unchanged semantics" from
+"narrower than configured") and errors on the first row that can neither land nor be
+absorbed — so callers can fail at config/grant time instead of at exec time.
 
 On Windows, idempotent deny-ACE bookkeeping is kept in a state file (default
 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`; override with `Manager.SetStateDir`),

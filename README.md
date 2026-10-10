@@ -53,7 +53,7 @@ policy := vbox.Policy{
 	FS: vbox.NewFSRuleSet(rules, vbox.EffDeny), // 未命中写兜底 = deny（读默认开放）
 	Net: vbox.NetRuleSet{
 		Rules:   []vbox.NetRule{{HostPort: "api.example.com:443", Allow: true}},
-		Default: false,
+		Default: false, // deny 姿态；逐条规则的落地口径见「网络规则落地」
 	},
 }
 
@@ -128,6 +128,31 @@ allow := policy.Net.Match("api.example.com:443")
 | Linux | bubblewrap | 整机只读视图 + 白名单写绑定；可实例化目标的 `ro`/`rw` 洞按行序回补；需要 bwrap 与 user namespace 可用 |
 | Windows | 受限令牌 + 显式拒绝 ACE | 句柄版 ACL（`\\?\` 长路径、`Get/SetSecurityInfo`）；终局 `rw` 目标跳过 ACE，`deny` 与独立 `ro` 行落拒绝 ACE；嵌套只读洞只在工具层生效 |
 | 其他 | 无内核沙箱 | 明确报错，不静默裸跑 |
+
+### 网络规则落地
+
+net 域的落地能力与 fs 不同，按「姿态 + 逐条」分开说：
+
+| 平台 | 姿态（Default） | 逐条规则 |
+| --- | --- | --- |
+| macOS | 内核落实（deny = 全断） | **仅 loopback** 逐条落实（Seatbelt remote tcp）；其余 deny 行拒启 |
+| Linux | 内核落实（deny = `--unshare-net` 全断，新 netns 的 loopback 未配置，回环同样不可达） | 不可表达 |
+| Windows | 仅 open；deny 姿态整体拒启 | 不可表达 |
+
+不可内核落实的行按方向处理，**永不比策略更宽**：
+
+- **deny 行**：跳过它沙箱就比策略宽——启动前拒绝（fail-closed）。
+- **allow 行**：在 deny 姿态下被吸收（目标在该姿态的沙箱里本不可达，收窄与
+  fail-closed 同向），记日志不拒启；在 open 姿态下本就是 no-op（无 deny 行
+  时不收紧）。
+- **`tool:` 前缀**：`tool:deny:169.254.169.254:*` 声明该行仅由调用方的工具层
+  （进程内 HTTP/MCP 客户端等）执行，内核落地一概跳过、不参与「能否落实」判定
+  ——用于平台无法落实但工具层可执行的规则。判定入口（`Match`/`Resolve`）不看
+  ToolOnly，工具层照常命中。
+
+启动前预检用 `CheckNetPolicy(platform, rules)`：逐条返回 landed / absorbed（含
+no-op 区分）分类，遇到「落实不了、跳过又会变宽」的行报错——调用方可在配置/
+授权那一刻就失败，而不是埋到 exec 期。
 
 Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件（默认
 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`，可用 `Manager.SetStateDir` 指定），

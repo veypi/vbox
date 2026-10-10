@@ -767,6 +767,9 @@ func seatbeltNetForms(spec confineSpec) []string {
 	seen := map[string]bool{}
 	var effective []NetRule
 	for _, r := range spec.netRules.Rules {
+		if r.ToolOnly {
+			continue // 工具层自负盈亏，内核不落地（CheckNetPolicy 同口径）
+		}
 		e, err := ParseEntry(r.HostPort)
 		if err != nil || !isLoopbackHost(e.Host) || seen[e.Port] {
 			continue
@@ -974,29 +977,15 @@ func validateProcessPolicy(spec confineSpec, platform string) error {
 	if platform == "windows" && spec.fsRules.DefaultWrite == EffRW {
 		return fail("this Windows backend cannot enforce fs_policy=open writable-everything")
 	}
-	if platform == "windows" && !spec.netRules.Default {
-		return fail("this Windows backend does not implement network rules")
+	// net 域按平台能力分类（CheckNetPolicy）：不可落实且不可吸收的行拒启
+	//（永不比策略更宽）；被吸收的行记日志（收窄方向的 no-op 说明）。
+	landings, err := CheckNetPolicy(platform, spec.netRules)
+	if err != nil {
+		return fail(err.Error())
 	}
-	for _, r := range spec.netRules.Rules {
-		e, err := ParseEntry(r.HostPort)
-		if err != nil {
-			return fail(err.Error())
-		}
-		// 全开放时 allow 不收紧权限，无需平台表达；deny 和锁定模式中的 allow 必须落实。
-		if r.Allow && spec.netRules.Default {
-			hasDeny := false
-			for _, other := range spec.netRules.Rules {
-				if !other.Allow {
-					hasDeny = true
-					break
-				}
-			}
-			if !hasDeny {
-				continue
-			}
-		}
-		if platform != "darwin" || !isLoopbackHost(e.Host) {
-			return fail("selective network rule is unsupported by this backend")
+	for _, l := range landings {
+		if !l.Landed && !l.Noop && spec.logf != nil {
+			spec.logf("net rule absorbed by landed posture (sandbox narrower than configured): %s — %s", l.Rule.String(), l.Reason)
 		}
 	}
 	if platform == "linux" {

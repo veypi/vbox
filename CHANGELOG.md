@@ -2,6 +2,47 @@
 
 版本号见 [VERSION](VERSION)，遵循 SemVer：破坏性变更进位 minor。
 
+## 0.3.2 — 2026-10-11
+
+### 修复
+
+- **net 规则按「能否内核落实」逐条分类，不再一刀切拒启**（修复两条实测缺陷）：
+  - 缺陷 A：Linux `net_policy=deny`（全断姿态）下任何 allow 行（含调用方内建的
+    `localhost:*` 放行）都会撞「selective network rule is unsupported」拒启——
+    最安全的姿态反而所有沙箱化 exec 不可用。现在 deny 姿态下的 allow 行被**吸收**：
+    目标在 `--unshare-net` 的沙箱 netns 里本不可达（loopback 未配置亦不通），跳过
+    该行的沙箱严格窄于策略，与 fail-closed 同向，记日志不拒启。
+  - 缺陷 B：open 姿态下添一条 `deny:` 行会在三平台全部拒启。deny 行的拒启语义
+    **保持不变**（跳过即比策略宽，永不发生），但 darwin 上「与可落实的 loopback
+    deny 行不相交的 allow 行」现在正确识别为 no-op，不再误伤（典型：配置了
+    loopback deny 后，任何非 loopback 的会话 grant 曾会把原生 exec 全部打死）。
+- **`CheckNetPolicy(platform, rules)` 导出**：启动前预检入口，逐条返回
+  landed / absorbed（`NetRowLanding`，含 Noop 区分「语义不变的吸收」与「收窄的
+  吸收」），遇到「落实不了、跳过又会变宽」的行报错——调用方可在配置/授权那一刻
+  失败，而不是埋到 exec 期。`validateProcessPolicy` 的 net 段改为调用它，行为变化
+  仅限上述两例。
+- **darwin loopback 分类按内核真实口径建模**（评审返修）：Seatbelt 把所有
+  loopback 拼写（localhost/127.0.0.1/::1…）坍缩为 `localhost:port`、按端口
+  首行生效、首个端口 `*` 行之后整表截断；逐行独立分类会在「同端口、混合拼写、
+  效果相反」的组合上误放——内核比策略更宽。`CheckNetPolicy` 现在模拟该内核表：
+  同端口后续行同效果为 no-op 重复；效果相反时 deny 行报错（指向统一拼写或
+  `tool:`），allow 行被吸收（收窄）。已知残余见函数注释与
+  docs/openshell-调研.md §3。
+
+### 新增
+
+- **`NetRule.ToolOnly` 与 `tool:` 规则前缀**（`ParseNetRule`；`ParseTargetRule`
+  保持不变）：声明该行仅由调用方工具层（进程内 HTTP/MCP 客户端等）执行，内核落地
+  与「能否落实」判定一律跳过——用于平台无法落实但工具层可执行的规则（典型：
+  linux/windows 上的选择性 deny）。判定入口（`Match`/`Resolve`）不看 ToolOnly。
+  `NetRule.String()` 返回含前缀的规范形态，供日志/回执。
+
+### 测试
+
+- 新增 `netpolicy_conformance_test.go`：平台 × 姿态 × 行形态的分类矩阵（判定层
+  纯函数，CI 全平台可跑），含上述两条缺陷的探针固化、tool: 行口径与 darwin
+  loopback 端口坍缩矩阵（混合拼写冲突 / 端口 * 截断 / 同效果重复）。
+
 ## 0.3.1 — 2026-10-10
 
 ### 修复

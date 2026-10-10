@@ -41,6 +41,17 @@ gofmt -l .
 - **Fail-closed**: an unexpressible rule is rejected at compile time; a host with no usable
   sandbox backend returns an error and the command does **not** run. Never add a silent
   unsandboxed fallback, and never let an approval at the caller side relax enforcement here.
+- **Net rules are classified by enforceability, never silently widened** (0.3.2):
+  `CheckNetPolicy` splits every row into landed / absorbed / refused. A `deny` row that
+  cannot land **refuses the launch** (dropping it would widen the sandbox). An `allow` row
+  under the deny posture is *absorbed* — the target is already unreachable there, so the
+  sandbox stays strictly narrower; that is logged, not refused. `tool:`-prefixed rows
+  (`NetRule.ToolOnly`) are the caller's tool-layer promise: the kernel path skips them and
+  they never block a launch. Do not extend absorption to deny rows, and do not let a
+  caller-provided flag bypass the refusal path. On darwin the kernel collapses every
+  loopback spelling into one per-port entry (first row wins, the first wildcard-port row
+  closes the table): `CheckNetPolicy` simulates that table — a conflicting loopback
+  `deny` row refuses, a conflicting `allow` row is absorbed narrower.
 - **Canonical pattern contract**: `Match` normalizes the path side only, so a rule pattern
   must already be canonical. `NewFSRuleSet` / `CompileFSRules` do that normalization; a
   hand-built `FSRuleSet` must not bypass it (on Windows a non-canonical `rw` row makes the
