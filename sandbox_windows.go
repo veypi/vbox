@@ -83,6 +83,14 @@ func findProcAny(name string, dlls ...*windows.LazyDLL) *windows.LazyProc {
 const (
 	subContainersAndObjectsInherit = 3 // 子目录 + 文件继承 ACE
 	fileAllAccess                  = 0x001F01FF
+	// defaultDaclAccess 用于令牌默认 DACL（setDefaultDacl）。令牌默认 DACL
+	// 会被沙箱进程新建的**所有**对象类型继承——包括子进程对象；fileAllAccess
+	// 是文件语义掩码，缺 PROCESS_QUERY_INFORMATION(0x0400) 与
+	// PROCESS_QUERY_LIMITED_INFORMATION(0x1000)，导致 taskkill/Stop-Process/
+	// Get-Process 这类「查询+终止」组合申请被拒（2026-10-16 实测：裸
+	// OpenProcess(PROCESS_TERMINATE) 可杀，标准工具全报拒绝访问）。
+	// 0x1400 超出文件 specific 位域（0x1FF），对文件对象无影响。
+	defaultDaclAccess = fileAllAccess | 0x1400
 
 	// CreateRestrictedToken Flags（Win11 26200 实测组合）：
 	//   - DISABLE_MAX_PRIVILEGE：除 SeChangeNotifyPrivilege 外特权全禁；
@@ -213,7 +221,7 @@ func setDefaultDacl(token windows.Token, sids []windows.SIDAndAttributes) error 
 	entries := make([]windows.EXPLICIT_ACCESS, 0, len(sids))
 	for _, sa := range sids {
 		entries = append(entries, windows.EXPLICIT_ACCESS{
-			AccessPermissions: fileAllAccess,
+			AccessPermissions: defaultDaclAccess,
 			AccessMode:        windows.GRANT_ACCESS,
 			Trustee: windows.TRUSTEE{
 				TrusteeForm:  windows.TRUSTEE_IS_SID,

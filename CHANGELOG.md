@@ -2,6 +2,17 @@
 
 版本号见 [VERSION](VERSION)，遵循 SemVer：破坏性变更进位 minor。
 
+## 0.3.3 — 2026-10-16
+
+### 修复
+
+- **Windows 沙箱令牌默认 DACL 补进程查询位（0x1400）**：`setDefaultDacl` 原先只授
+  `FILE_ALL_ACCESS`（文件语义掩码），缺 `PROCESS_QUERY_INFORMATION` /
+  `PROCESS_QUERY_LIMITED_INFORMATION`——而令牌默认 DACL 会被沙箱进程新建的**所有**
+  对象类型继承（包括子进程对象），导致 taskkill / Stop-Process / Get-Process 这类
+  「查询+终止」组合申请被拒（实测：裸 `OpenProcess(PROCESS_TERMINATE)` 可杀，标准
+  工具全报拒绝访问）。0x1400 超出文件 specific 位域（0x1FF），对文件对象无影响。
+
 ## 0.3.2 — 2026-10-11
 
 ### 修复
