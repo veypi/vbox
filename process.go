@@ -23,7 +23,7 @@ type StartOptions struct {
 	// RawOutput preserves bytes and write errors without line buffering or
 	// Windows code-page conversion. Protocol pipes and binary tools require it.
 	RawOutput bool
-	// NoSandbox 是免沙箱执行标记（hosts-vsh-redesign §3.3），合法来源：
+	// NoSandbox 是免沙箱执行标记（契约见 aic-pod/docs/host_sandbox.md），合法来源：
 	//   - 内部管控调用方（ssh/scp、browser，由执行环境自身管控）；
 	//   - 外部请求显式携带 nosandbox（发送前审批；审批本身不免沙箱，
 	//     仅放行该标记）；

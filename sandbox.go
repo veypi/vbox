@@ -257,7 +257,7 @@ func pathDepth(p string) int {
 	return strings.Count(filepath.ToSlash(strings.TrimSuffix(p, "/")), "/")
 }
 
-// evaluateFSPolicy 是「先求值后落措施」（W3，permission_rules §5）的单一
+// evaluateFSPolicy 是「先求值后落措施」（W3，aic/docs/permission.md「内核层映射」）的单一
 // 入口：候选路径 = deny 实例化目标 ∪ 规则表 ro/rw 字面行中落在覆盖目标/
 // 可写根之下（fsOpen 时任意位置）者；每个候选经 first-wins Match 求终局——
 // 终局 deny → 覆盖；ro（写拒读放）→ ro-bind；rw → rw-bind。每路径只出一

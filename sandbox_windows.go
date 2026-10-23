@@ -276,7 +276,7 @@ func userSidOf(token windows.Token) (*windows.SID, error) {
 
 // aclObjectPath 把原生态路径规整为长路径安全形态（\\?\ 前缀）：绕过
 // MAX_PATH 限制——注册表 LongPathsEnabled=0 的机器上，无前缀的 >260 字符
-// 路径在 Win32 层直接失败（本机注册表已开，见 permission_rules/测试）。
+// 路径在 Win32 层直接失败（本机注册表已开，见 aic/docs/permission.md 与测试）。
 func aclObjectPath(path string) string {
 	p := strings.ReplaceAll(path, "/", `\`)
 	if strings.HasPrefix(p, `\\?\`) {
