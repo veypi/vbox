@@ -38,7 +38,7 @@
   效果相反」的组合上误放——内核比策略更宽。`CheckNetPolicy` 现在模拟该内核表：
   同端口后续行同效果为 no-op 重复；效果相反时 deny 行报错（指向统一拼写或
   `tool:`），allow 行被吸收（收窄）。已知残余见函数注释与
-  docs/openshell-调研.md §3。
+  docs/TODO.md 第 10 节（原 OpenShell 调研结论并入该文档）。
 
 ### 新增
 
