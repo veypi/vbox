@@ -23,8 +23,8 @@ func applyToken(cmd *exec.Cmd, token uintptr) error { return nil }
 // closeToken 无句柄可关（非 windows 平台恒 0，no-op）。
 func closeToken(token uintptr) {}
 
-// assignJob 无 Job Object（非 windows 平台恒 no-op；资源限制由 bwrap
-// --rlimit / sh ulimit 承担）。
+// assignJob 无 Job Object（非 windows 平台恒 no-op；资源限制由 prlimit
+// 包装 bwrap / sh ulimit 承担）。
 func assignJob(pid int, job uintptr) error { return nil }
 
 // closeJob 无句柄可关（非 windows 平台恒 no-op）。

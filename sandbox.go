@@ -147,16 +147,20 @@ func sandboxUnavailable() error {
 //     排序输出（后绑定覆盖先绑定）
 //   - read-only（level 1）：无任何可写挂载（/dev/null 由 --dev 提供）
 //
-// rlimitArgs 构建 bwrap 资源限制参数段（--rlimit TYPE VALUE ...）。
-// bwrap 在 exec 前对子进程 setrlimit（soft=hard），与文件隔离正交、
-// read-only 与 workspace-write 同限（resourceLimit* 常量统一语义）。
-func rlimitArgs() []string {
+// prlimitArgs 构建 Linux 资源限制参数段（prlimit --AS=... -- ...）。
+// bwrap 本身没有 --rlimit 选项（0.11~0.13 实测均报 Unknown option），
+// 故限制由 util-linux prlimit 在 exec 前对 bwrap 及其子孙进程落实
+// （soft=hard，跨 exec 继承）；与文件隔离正交、read-only 与
+// workspace-write 同限（resourceLimit* 常量统一语义）。
+func prlimitArgs() []string {
 	return []string{
-		"--rlimit", "AS", strconv.FormatUint(uint64(resourceLimitAS), 10),
-		"--rlimit", "NOFILE", strconv.Itoa(resourceLimitNoFile),
-		"--rlimit", "CPU", strconv.Itoa(resourceLimitCPU),
-		"--rlimit", "FSIZE", strconv.FormatUint(uint64(resourceLimitFSize), 10),
-		"--rlimit", "CORE", "0",
+		"prlimit",
+		"--as=" + strconv.FormatUint(uint64(resourceLimitAS), 10),
+		"--nofile=" + strconv.Itoa(resourceLimitNoFile),
+		"--cpu=" + strconv.Itoa(resourceLimitCPU),
+		"--fsize=" + strconv.FormatUint(uint64(resourceLimitFSize), 10),
+		"--core=0",
+		"--",
 	}
 }
 
@@ -191,7 +195,6 @@ func bwrapArgs(spec confineSpec, cacheDirs []string, deny denyMountPlan) []strin
 		// linux 不生效（近似层，net_allow 仅 darwin 落地；见 host_sandbox.md）。
 		args = append(args, "--unshare-net")
 	}
-	args = append(args, rlimitArgs()...)
 	// 沙箱 profile 由 rules 派生（数字等级已删除）：临时区/缓存/可写根一律放行。
 	args = append(args, "--tmpfs", "/tmp")
 	for _, d := range cacheDirs {

@@ -126,7 +126,7 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 
 	// 资源限制（§5.10）：windows 立即把子进程关联进 Job Object（内存/进程数
 	// 上限生效）。关联失败必须 fail-closed——杀掉已启动进程并返回错误，
-	// 绝不裸跑（linux bwrap --rlimit / darwin sh ulimit 在 argv 包装内已生效）。
+	// 绝不裸跑（linux prlimit+bwrap / darwin sh ulimit 在 argv 包装内已生效）。
 	if plan.job != 0 {
 		if err := assignJob(cmd.Process.Pid, plan.job); err != nil {
 			_ = cmd.Process.Kill()

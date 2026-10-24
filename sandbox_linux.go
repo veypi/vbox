@@ -4,6 +4,7 @@ package vbox
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 )
 
@@ -52,5 +53,11 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if err != nil {
 		return launchPlan{}, err
 	}
-	return launchPlan{argv: bwrapArgs(spec, spec.writeRoots(), plan)}, nil
+	// 资源限制：bwrap 无 --rlimit（上游至今未提供），改用 util-linux prlimit
+	// 包装在 exec 前落限制，再由 bwrap 挂沙箱；缺 prlimit 即 fail-closed。
+	if _, err := exec.LookPath("prlimit"); err != nil {
+		return launchPlan{}, fmt.Errorf("sandbox: prlimit not found (util-linux required for resource limits): %w", err)
+	}
+	argv := append(prlimitArgs(), bwrapArgs(spec, spec.writeRoots(), plan)...)
+	return launchPlan{argv: argv}, nil
 }

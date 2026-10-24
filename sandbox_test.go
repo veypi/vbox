@@ -60,9 +60,9 @@ func TestUnconfinedIgnoresPolicy(t *testing.T) {
 	}
 }
 
-// bwrap 包装：读视图为整机 ro-bind（读默认开放）；fsOpen 改 rw bind；
+// bwrapArgs 包装：读视图为整机 ro-bind（读默认开放）；fsOpen 改 rw bind；
 // 临时区 tmpfs + 缓存目录 bind 恒定携带（profile 由 rules 派生）；命令在
-// -- 之后原样。资源限制段（rlimitArgs，与文件隔离正交）恒定携带。
+// -- 之后原样。资源限制不在 bwrap argv 里（见 prlimitArgs）。
 func TestBwrapArgs(t *testing.T) {
 	argv := []string{"bash", "-c", "echo hi"}
 	spec := confineSpec{workdir: "/ungranted", argv: argv, fsRules: FSRuleSet{}, netRules: NetRuleSet{Default: true}}
@@ -718,20 +718,23 @@ func TestDenyCoverAllCached(t *testing.T) {
 	}
 }
 
-// rlimitArgs 三端同一组上限：AS 4GiB / NOFILE 1024 / CPU 600 /
+// prlimitArgs 三端同一组上限：AS 4GiB / NOFILE 1024 / CPU 600 /
 // FSIZE 1GiB / CORE 0（与 resourceLimit* 常量一致，防硬编码漂移）。
+// bwrap 没有 --rlimit（0.11~0.13 实测均不支持），限制由 prlimit 包装。
 // 不含 NPROC：RLIMIT_NPROC 按 real-UID 全系统计数，桌面常驻进程即超限（见
 // sandbox.go 常量块注释）。
-func TestRlimitArgs(t *testing.T) {
-	got := rlimitArgs()
+func TestPrlimitArgs(t *testing.T) {
+	got := prlimitArgs()
 	want := []string{
-		"--rlimit", "AS", "4294967296",
-		"--rlimit", "NOFILE", "1024",
-		"--rlimit", "CPU", "600",
-		"--rlimit", "FSIZE", "1073741824",
-		"--rlimit", "CORE", "0",
+		"prlimit",
+		"--as=4294967296",
+		"--nofile=1024",
+		"--cpu=600",
+		"--fsize=1073741824",
+		"--core=0",
+		"--",
 	}
-	assertEqual(t, "rlimits", got, want)
+	assertEqual(t, "prlimits", got, want)
 }
 
 // confineRlimits（darwin）：sh ulimit 包装——脚本含资源上限 + exec "$@"
