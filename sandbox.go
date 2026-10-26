@@ -4,7 +4,6 @@ package vbox
 
 import (
 	"fmt"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -66,11 +65,12 @@ const (
 //   - cleanup：进程结束后调用（windows：撤销 per-call deny ACE + 删除私有
 //     临时目录 + 关闭 Job Object；其他平台 nil）
 type launchPlan struct {
-	argv    []string
-	token   uintptr
-	job     uintptr
-	env     []string
-	cleanup func()
+	argv      []string
+	token     uintptr
+	job       uintptr
+	env       []string
+	forcedEnv []string
+	cleanup   func()
 }
 
 var (
@@ -81,11 +81,13 @@ var (
 // confineSpec 是一次沙箱包装的完整输入（三域授权模型快照 + 等级/工作区/argv）。
 // 快照语义：每次 Start 读当次值（set_config/grant 动态生效），已启动进程不回溯。
 type confineSpec struct {
-	workdir  string
-	argv     []string
-	fsRules  FSRuleSet
-	netRules NetRuleSet
-	logf     func(string, ...any)
+	workdir   string
+	argv      []string
+	fsRules   FSRuleSet
+	netRules  NetRuleSet
+	logf      func(string, ...any)
+	resources *resourceCache
+	egress    *egressLease
 }
 
 func processSpec(opts StartOptions, logf func(string, ...any)) confineSpec {
@@ -93,9 +95,10 @@ func processSpec(opts StartOptions, logf func(string, ...any)) confineSpec {
 }
 
 func (s confineSpec) denyPatterns() []string {
+	dead := ineffectiveRuleSet(s.fsRules.Rules)
 	var out []string
-	for _, r := range s.fsRules.Rules {
-		if r.Effect == EffDeny {
+	for i, r := range s.fsRules.Rules {
+		if r.Effect == EffDeny && !dead[i] {
 			out = append(out, r.Pattern)
 		}
 	}
@@ -109,9 +112,25 @@ func (s confineSpec) writeRoots() []string {
 			continue
 		}
 		p := strings.TrimSuffix(r.Pattern, "/**")
-		if !strings.ContainsAny(p, "*?") {
+		if strings.ContainsAny(p, "*?") {
+			continue
+		}
+		decision := s.fsRules.Match(p, OpWrite)
+		if decision.Allow && decision.Effect == EffRW {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+func ineffectiveRuleSet(rules []Rule) map[int]bool {
+	rows := IneffectiveRows(rules)
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make(map[int]bool, len(rows))
+	for _, i := range rows {
+		out[i] = true
 	}
 	return out
 }
@@ -260,7 +279,7 @@ func pathDepth(p string) int {
 	return strings.Count(filepath.ToSlash(strings.TrimSuffix(p, "/")), "/")
 }
 
-// evaluateFSPolicy 是「先求值后落措施」（W3，aic/docs/permission.md「内核层映射」）的单一
+// evaluateFSPolicy 是「先求值后落措施」（W3，aic/docs/reference/permission.md「内核层映射」）的单一
 // 入口：候选路径 = deny 实例化目标 ∪ 规则表 ro/rw 字面行中落在覆盖目标/
 // 可写根之下（fsOpen 时任意位置）者；每个候选经 first-wins Match 求终局——
 // 终局 deny → 覆盖；ro（写拒读放）→ ro-bind；rw → rw-bind。每路径只出一
@@ -305,8 +324,9 @@ func evaluateFSPolicy(targets []string, rules *FSRuleSet, writable []string, fsO
 		return fsOpen || underAnyPath(cpath, canonCover) || underAnyPath(cpath, canonWritable)
 	}
 	var globs []string
-	for _, r := range rules.Rules {
-		if r.Effect == EffDeny {
+	dead := ineffectiveRuleSet(rules.Rules)
+	for i, r := range rules.Rules {
+		if r.Effect == EffDeny || dead[i] {
 			continue
 		}
 		if strings.ContainsAny(r.Pattern, "*?") {
@@ -644,65 +664,18 @@ func denyWalkRoot(pat string) (string, bool) {
 	return root, true
 }
 
-// ---- deny 实例化缓存（per-call 沙箱提速：B 方案）----
-
-// denyCoverCacheTTL 是 deny 实例化结果的保鲜期：TTL 内同一 deny 模式集的
-// ** 递归枚举结果直接复用（win 实测一趟 $HOME 枚举 1.9-2.6s，共享遍历后
-// 仍是每条沙箱命令的最大单项开销）。语义取舍（2026-09-23 用户批准）：
-// 窗口内新建的匹配对象在下次重算前不会被打 deny ACE / 覆盖挂载（≤TTL）。
-// 变量而非常量：测试可缩短以验证过期重算。
-var denyCoverCacheTTL = 30 * time.Second
-
-// denyCoverCacheEntry 是最近一次实例化结果的快照（键 = 模式列表）。
-type denyCoverCacheEntry struct {
-	key     string
-	at      time.Time
-	targets []string
-	err     error
-}
-
-var (
-	denyCoverCacheMu sync.Mutex
-	denyCoverCache   *denyCoverCacheEntry
-)
-
-// denyCoverAllCached 是 denyCoverAll 的带缓存版本（生产路径使用：windows
-// ensureDenyACEs、linux planConfined；测试直接调 denyCoverAll，与文件系统
-// 实时对齐、不受缓存影响）。缓存以 deny 模式集为键、TTL 为界；锁覆盖整段
-// 计算以合并并发的相同请求（并发不同策略仍串行——单次遍历时长量级，可接受）。
-// cached 报告本次是否命中缓存：windows 侧据此只在重算时做 ACE 校验对账
-// （缓存命中的稳态调用不做任何 ACL 读）。返回的切片是缓存内部快照，调用方
-// 不得修改。err 一并缓存：不可实例化形态与超预算都是确定性判定，复用不改变
-// fail-closed 行为。
-func denyCoverAllCached(pats []string, logf func(string, ...any)) (targets []string, cached bool, err error) {
-	key := strings.Join(pats, "\x00")
-	denyCoverCacheMu.Lock()
-	defer denyCoverCacheMu.Unlock()
-	if e := denyCoverCache; e != nil && e.key == key {
-		if age := time.Since(e.at); age < denyCoverCacheTTL {
-			if logf != nil {
-				logf("sandbox: deny instantiate cache hit: targets=%d age=%s", len(e.targets), age.Round(time.Millisecond))
-			}
-			return e.targets, true, e.err
-		}
-	}
-	start := time.Now()
-	targets, err = denyCoverAll(pats)
-	denyCoverCache = &denyCoverCacheEntry{key: key, at: time.Now(), targets: targets, err: err}
-	if logf != nil {
-		logf("sandbox: deny instantiate: walk=%s targets=%d err=%v", time.Since(start).Round(time.Millisecond), len(targets), err)
-	}
-	return targets, false, err
-}
-
 // ---- darwin: Seatbelt (sandbox-exec) ----
 
 // macosSeatbeltExecutable 是 sandbox-exec 的固定路径（防 PATH 注入：
 // 若 /usr/bin/sandbox-exec 被篡改，攻击者已 root）。
 const macosSeatbeltExecutable = "/usr/bin/sandbox-exec"
 
-// seatbeltArgs 将文件规则表逆序映射到 SBPL，保持 first-wins 语义。
-func seatbeltArgs(spec confineSpec) []string {
+// seatbeltArgs 将文件与网络规则映射到 SBPL，保持 level + 原表序语义。
+func seatbeltArgs(spec confineSpec) ([]string, error) {
+	netForms, err := seatbeltNetForms(spec)
+	if err != nil {
+		return nil, err
+	}
 	forms := []string{
 		"(version 1)",
 		"(allow default)",
@@ -713,14 +686,26 @@ func seatbeltArgs(spec confineSpec) []string {
 		// fs_policy=open：写全放（表内 deny 行在后输出，继续生效）。
 		forms = append(forms, "(allow file-write*)")
 	}
-	forms = append(forms, seatbeltNetForms(spec)...)
+	forms = append(forms, netForms...)
 	{
-		// first-wins → SBPL 逆序输出。AF_UNIX connect 不走 file-* 判定（实测
-		// 2026-09-05）——deny/allow 行都带 network-outbound (remote unix) 形态，
-		// socket 覆盖与文件路径同口径（2026-09-23 探针复核）。写放行只看规则行。
-		rows := spec.fsRules.Rules
-		for i := len(rows) - 1; i >= 0; i-- {
-			r := rows[i]
+		// level + 原表序 → SBPL 后命中胜：低 level 先输出，同 level 原表
+		// 后行先输出。AF_UNIX connect 不走 file-* 判定（实测 2026-09-05）。
+		type indexedRule struct {
+			rule  Rule
+			index int
+		}
+		rows := make([]indexedRule, len(spec.fsRules.Rules))
+		for i, r := range spec.fsRules.Rules {
+			rows[i] = indexedRule{rule: r, index: i}
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].rule.Level != rows[j].rule.Level {
+				return rows[i].rule.Level < rows[j].rule.Level
+			}
+			return rows[i].index > rows[j].index
+		})
+		for _, row := range rows {
+			r := row.rule
 			if r.Pattern == "" {
 				continue
 			}
@@ -747,7 +732,7 @@ func seatbeltArgs(spec confineSpec) []string {
 			}
 		}
 	}
-	return append([]string{macosSeatbeltExecutable, "-p", stringsJoin(forms), "--"}, spec.argv...)
+	return append([]string{macosSeatbeltExecutable, "-p", stringsJoin(forms), "--"}, spec.argv...), nil
 }
 
 // sbplFilter 把 vbox 规则模式转为 SBPL 过滤形：裸模式（无 *?）= subpath 字面
@@ -759,40 +744,33 @@ func sbplFilter(pat string) string {
 	return "(subpath " + sbplString(pat) + ")"
 }
 
-// seatbeltNetForms 先消除被前序规则覆盖的端口，再输出 Seatbelt 规则。
-// Seatbelt 网络过滤器的具体端口优先于通配端口，不能仅靠逆序输出实现 first-wins。
-// 本后端仅能区分 loopback 端口；其他目标在启动前校验中拒绝。
-func seatbeltNetForms(spec confineSpec) []string {
+// seatbeltNetForms 与 CheckNetPolicy 共用 compileNetPlan；这里只负责把
+// 计划中的 loopback 内核项转成 SBPL，不重写优先级或能力判断。
+func seatbeltNetForms(spec confineSpec) ([]string, error) {
+	var transport []string
+	if spec.egress != nil && spec.egress.endpoint != nil {
+		transport = append(transport, spec.egress.endpoint.httpAddr, spec.egress.endpoint.socksAddr)
+	}
+	plan, err := compileNetPlan("darwin", spec.netRules, netCapsForPlatform("darwin"), transport...)
+	if err != nil {
+		return nil, err
+	}
 	var forms []string
 	if !spec.netRules.Default {
 		forms = append(forms, "(deny network-inbound)", "(deny network-outbound)")
 	}
-	seen := map[string]bool{}
-	var effective []NetRule
-	for _, r := range spec.netRules.Rules {
-		if r.ToolOnly {
-			continue // 工具层自负盈亏，内核不落地（CheckNetPolicy 同口径）
+	for _, r := range plan.kernelRules {
+		e, err := ParseRuleEntry(r.HostPort)
+		if err != nil {
+			return nil, err
 		}
-		e, err := ParseEntry(r.HostPort)
-		if err != nil || !isLoopbackHost(e.Host) || seen[e.Port] {
-			continue
-		}
-		seen[e.Port] = true
-		effective = append(effective, r)
-		if e.Port == "*" {
-			break
-		}
-	}
-	for i := len(effective) - 1; i >= 0; i-- {
-		r := effective[i]
-		e, _ := ParseEntry(r.HostPort)
 		verb := "deny"
 		if r.Allow {
 			verb = "allow"
 		}
 		forms = append(forms, seatbeltEntryForms(e, verb)...)
 	}
-	return forms
+	return forms, nil
 }
 
 func seatbeltEntryForms(e Entry, verb string) []string {
@@ -808,13 +786,8 @@ func seatbeltEntryForms(e Entry, verb string) []string {
 
 // isLoopbackHost 判定 loopback 条目（localhost 字面或 IPv4/IPv6 loopback）。
 func isLoopbackHost(h string) bool {
-	if h == "localhost" {
-		return true
-	}
-	if ip, err := netip.ParseAddr(h); err == nil {
-		return ip.IsLoopback()
-	}
-	return false
+	h = CanonicalNetHost(h)
+	return h == "localhost" || h == "*.localhost"
 }
 
 func stringsJoin(forms []string) string {
@@ -964,6 +937,9 @@ func regexEscape(c byte) string {
 // requested scope. Never approximate host rules by opening all hosts or paths.
 func validateProcessPolicy(spec confineSpec, platform string) error {
 	fail := func(why string) error { return &DeniedError{Reason: "sandbox cannot enforce host policy: " + why} }
+	if spec.fsRules.Err != nil {
+		return fail("file authorization configuration: " + spec.fsRules.Err.Error())
+	}
 	for _, r := range spec.fsRules.Rules {
 		if r.Pattern == "" || r.Effect > EffRW {
 			return fail("invalid file rule")
@@ -984,16 +960,20 @@ func validateProcessPolicy(spec confineSpec, platform string) error {
 	//（永不比策略更宽）；被吸收的行记日志（收窄方向的 no-op 说明）。
 	landings, err := CheckNetPolicy(platform, spec.netRules)
 	if err != nil {
-		return fail(err.Error())
+		if IsUnsupported(err) {
+			return fail(err.Error())
+		}
+		return err
 	}
 	for _, l := range landings {
-		if !l.Landed && !l.Noop && spec.logf != nil {
-			spec.logf("net rule absorbed by landed posture (sandbox narrower than configured): %s — %s", l.Rule.String(), l.Reason)
+		if l.Absorbed && spec.logf != nil {
+			spec.logf("net rule absorbed by launch plan: %s — %s", l.Rule.String(), l.Reason)
 		}
 	}
 	if platform == "linux" {
-		for _, r := range spec.fsRules.Rules {
-			if r.Effect == EffRW && strings.ContainsAny(strings.TrimSuffix(r.Pattern, "/**"), "*?") {
+		dead := ineffectiveRuleSet(spec.fsRules.Rules)
+		for i, r := range spec.fsRules.Rules {
+			if !dead[i] && r.Effect == EffRW && strings.ContainsAny(strings.TrimSuffix(r.Pattern, "/**"), "*?") {
 				return fail("Linux mount confinement cannot enforce this path glob: " + r.Pattern)
 			}
 		}

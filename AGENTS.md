@@ -11,7 +11,8 @@ derived from an **ordered rule table handed in by the caller**. vbox owns rule e
 platform enforcement and process supervision. Callers own config parsing, approvals, grant
 lifetimes and audit. Module path `github.com/veypi/vbox`; dependencies limited to
 `golang.org/x/sys` and `golang.org/x/text` (no cgo, no `replace` in `go.mod`) — third parties
-must be able to `go get` it as-is. Reference caller: `aic-pod` `libs/host`.
+must be able to `go get` it as-is. Command registration, shell execution and product
+integration are outside this repository's scope and documentation.
 
 ## Build, test, verify
 
@@ -35,29 +36,33 @@ gofmt -l .
 
 ## Invariants (do not change without an explicit decision)
 
-- **First-wins is the whole semantics**: rows are scanned front to back, the first match
-  decides; `Class` only groups rows while concatenating and is ignored by matching. Do not
-  add "specificity" or override layers.
+- **Target priority is `level + original order`**: higher levels match first; within one
+  level, rows are scanned front to back and the first match decides. `Class` only groups rows
+  while concatenating and is ignored by matching and level assignment. Do not add "specificity"
+  or implicit override layers. Cache and darwin-proxy implementation is present; only
+  real-host acceptance and release follow-up remain in `docs/development/todo.md`.
 - **Fail-closed**: an unexpressible rule is rejected at compile time; a host with no usable
   sandbox backend returns an error and the command does **not** run. Never add a silent
   unsandboxed fallback, and never let an approval at the caller side relax enforcement here.
-- **Net rules are classified by enforceability, never silently widened** (0.3.2):
-  `CheckNetPolicy` splits every row into landed / absorbed / refused. A `deny` row that
-  cannot land **refuses the launch** (dropping it would widen the sandbox). An `allow` row
-  under the deny posture is *absorbed* — the target is already unreachable there, so the
-  sandbox stays strictly narrower; that is logged, not refused. `tool:`-prefixed rows
-  (`NetRule.ToolOnly`) are the caller's tool-layer promise: the kernel path skips them and
-  they never block a launch. Do not extend absorption to deny rows, and do not let a
-  caller-provided flag bypass the refusal path. On darwin the kernel collapses every
-  loopback spelling into one per-port entry (first row wins, the first wildcard-port row
-  closes the table): `CheckNetPolicy` simulates that table — a conflicting loopback
-  `deny` row refuses, a conflicting `allow` row is absorbed narrower.
+- **Net rules are classified by enforceability, never silently widened**:
+  `CheckNetPolicy` reports `Kernel` / `Proxy` / `Absorbed` / `Reserved` landings. An
+  effective `deny` row that cannot land refuses the launch with `UnsupportedError`;
+  syntax errors stay distinct. An `allow` row may be absorbed only when omitting it
+  stays narrower. There is no execution-layer prefix or field. On darwin, loopback
+  spellings are canonicalized and `compileNetPlan` keeps the winning row for every
+  port class instead of rejecting conflicts merely because they exist. Static preflight
+  and Seatbelt emission consume the same plan. Under darwin deny, non-loopback rows use
+  the authenticated in-process HTTP/SOCKS5 endpoint with an immutable full net snapshot;
+  open and NoSandbox do not start it. Proxy listener ports are Reserved transport rows,
+  not caller grants. Explicit `UpstreamProxy` is part of netKey; ambient proxy variables
+  must never select an upstream. Proxy env is forced after caller Env, and DNS resolution
+  must authorize concrete IPs before any direct or upstream connection.
 - **Canonical pattern contract**: `Match` normalizes the path side only, so a rule pattern
   must already be canonical. `NewFSRuleSet` / `CompileFSRules` do that normalization; a
   hand-built `FSRuleSet` must not bypass it (on Windows a non-canonical `rw` row makes the
   writable root look read-only and the child is denied write access to its own workspace).
-- **`IneffectiveRows` stays conservative**: report only rows an earlier `rw` row provably
-  covers (identical pattern, `/**` prefix, bare-path subtree); never report a case that
+- **`IneffectiveRows` stays conservative**: report only rows a higher-priority `rw`
+  row provably covers (identical pattern, `/**` prefix, bare-path subtree); never report a case that
   relies on guessing glob containment, and never fail compilation because of a dead row.
 - **Windows deny-ACE model**: deny/ro rows get a persistent explicit deny ACE; `rw` targets
   get none; the ACE is *not* revoked when the process exits (descendants may outlive the
@@ -93,6 +98,11 @@ gofmt -l .
 
 ## Docs conventions
 
+- Unified layout (shared across the ivec repos): `README.md` (+ `README.en.md`),
+  `CHANGELOG.md` and `AGENTS.md` at the root; everything else under `docs/` with
+  `docs/index.md` as the map and `architecture/` / `reference/` / `guides/` /
+  `development/` as the only categories. Plans, TODOs and retrospectives live in
+  `development/` and never masquerade as current contracts.
 - `README.md` is **Chinese** and is the repo's main, human-facing entry point: what it is, quick
   start, rules, platform support, process contract, what is intentionally out of scope.
   `README.en.md` is the English mirror; both start with a language switcher line and must be
@@ -100,8 +110,12 @@ gofmt -l .
 - Keep editorial detail (invariants, file-by-file maps, verification workflow) out of the
   READMEs — that belongs in this file.
 - `CHANGELOG.md` records user-visible behavior, breaking changes first; `VERSION` holds the
-  current version. Review `git status` before committing; tags are created locally only and
+  current version. Completed changes go to the changelog, future plans only to
+  `docs/development/todo.md`. Review `git status` before committing; tags are created locally only and
   pushed only on explicit instruction.
+- Documentation describes only the generic native-process sandbox library. Do not add
+  product-specific command systems, shell runtimes, integrators or their configuration
+  domains to the README, contributor guide or design TODO.
 
 ## Commits
 

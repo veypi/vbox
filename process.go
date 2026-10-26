@@ -23,7 +23,7 @@ type StartOptions struct {
 	// RawOutput preserves bytes and write errors without line buffering or
 	// Windows code-page conversion. Protocol pipes and binary tools require it.
 	RawOutput bool
-	// NoSandbox 是免沙箱执行标记（契约见 aic-pod/docs/host_sandbox.md），合法来源：
+	// NoSandbox 是免沙箱执行标记（契约见 aic-pod/docs/reference/host-sandbox.md），合法来源：
 	//   - 内部管控调用方（ssh/scp、browser，由执行环境自身管控）；
 	//   - 外部请求显式携带 nosandbox（发送前审批；审批本身不免沙箱，
 	//     仅放行该标记）；
@@ -54,15 +54,17 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 		return 0, fmt.Errorf("exec: custom argv0 is not supported by this sandbox launcher")
 	}
 	if confined {
-		// 行序陷阱提示：deny/ro 行被上方 rw 行完全覆盖时永不生效（first-wins），
-		// 执行端只会安静地放行——这里给配置作者留一条可寻的日志。
+		// deny/ro 行被更高优先级的 rw 行完全覆盖时永不生效；执行端只会
+		// 安静地放行——这里给配置作者留一条可寻的日志。
 		if logf != nil {
 			if shadowed := IneffectiveRows(opts.Policy.FS.Rules); len(shadowed) > 0 {
-				logf("sandbox: %d fs rule row(s) shadowed by an earlier rw row (never effective): %v", len(shadowed), shadowed)
+				logf("sandbox: %d fs rule row(s) shadowed by a higher-priority rw row (never effective): %v", len(shadowed), shadowed)
 			}
 		}
 		var err error
-		plan, err = planConfined(processSpec(opts, logf))
+		spec := processSpec(opts, logf)
+		spec.resources = m.cache
+		plan, err = planConfined(spec)
 		if err != nil {
 			return 0, err
 		}
@@ -78,7 +80,7 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 	if opts.ReplaceEnv {
 		inherited = []string{}
 	}
-	cmd.Env = processEnv(inherited, plan.env, opts.Env, confined)
+	cmd.Env = processEnv(inherited, plan.env, opts.Env, confined, plan.forcedEnv)
 	// Windows 上经逐行转码（GBK→UTF-8）后落盘，其余平台原样直写；
 	// stdout/stderr 分流（诊断不污染 stdout 的 --json 契约与管道数据）。
 	cmd.Stdin = stdin
@@ -110,6 +112,10 @@ func (m *Manager) RunProcess(ctx context.Context, opts StartOptions, stdin io.Re
 	h := &procHandle{done: make(chan struct{})}
 	defer close(h.done)
 	if err := m.track(h); err != nil {
+		closeToken(plan.token)
+		if plan.cleanup != nil {
+			plan.cleanup()
+		}
 		return 0, err
 	}
 	defer m.untrack(h)

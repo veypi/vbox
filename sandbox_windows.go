@@ -276,7 +276,7 @@ func userSidOf(token windows.Token) (*windows.SID, error) {
 
 // aclObjectPath 把原生态路径规整为长路径安全形态（\\?\ 前缀）：绕过
 // MAX_PATH 限制——注册表 LongPathsEnabled=0 的机器上，无前缀的 >260 字符
-// 路径在 Win32 层直接失败（本机注册表已开，见 aic/docs/permission.md 与测试）。
+// 路径在 Win32 层直接失败（本机注册表已开，见 aic/docs/reference/permission.md 与测试）。
 func aclObjectPath(path string) string {
 	p := strings.ReplaceAll(path, "/", `\`)
 	if strings.HasPrefix(p, `\\?\`) {
@@ -501,7 +501,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	var tmpDir string
 	var grantD, tmpD time.Duration
 	// fs deny：稳定 SID + 持久拒绝 ACE（幂等 ensure；不按进程撤销）
-	denySid, err := ensureDenyACEs(deny, &spec.fsRules, writable, logf)
+	denySid, err := ensureDenyACEs(deny, &spec.fsRules, writable, logf, spec.resources)
 	if err != nil {
 		return launchPlan{}, err
 	}
@@ -830,7 +830,7 @@ func denyParallelPaths(paths []string, fn func(i int, path string) error) error 
 //
 // 返回 deny SID（无目标 = nil，此时无需放进 restricting list）与错误：
 // 可达对象加不上 ACE → fail-closed（命令不执行；已打上的 ACE 保留并落状态）。
-func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf func(string, ...any)) (*windows.SID, error) {
+func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf func(string, ...any), cache *resourceCache) (*windows.SID, error) {
 	if len(patterns) == 0 && rules == nil {
 		return nil, nil
 	}
@@ -838,7 +838,7 @@ func ensureDenyACEs(patterns []string, rules *FSRuleSet, writable []string, logf
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: deny sid: %w", err)
 	}
-	targets, cached, err := denyCoverAllCached(patterns, logf)
+	targets, cached, err := denyCoverAllCached(cache, patterns, logf)
 	if err != nil {
 		return nil, err
 	}

@@ -16,10 +16,13 @@ code, err := mgr.RunProcess(ctx, vbox.StartOptions{
 vbox 只做一件事：拿到**你**给的规则快照，让操作系统为一个子进程落实它。配置解析、审批、
 授权生命周期、审计都在调用方——vbox 不读你的配置，也不替你决定策略。
 
+本文描述现行规则契约；Manager 快照缓存与 darwin deny 姿态内建出站代理已经实现，
+实机验收与后续工作见 [docs/development/todo.md](docs/development/todo.md)。
+
 ## 它能给你什么
 
-- **一张有序规则表，首命中生效**：行序就是策略，没有覆盖层、没有「更具体的规则胜」；
-  新规则插表头。
+- **一张有序规则表，`level + 原表序` 生效**：高 level 先匹配，同 level 按原表首命中；
+  没有「更具体的规则胜」或隐式覆盖层，`Class` 不推导 level。
 - **内核执行，不是模拟**：macOS Seatbelt（SBPL）、Linux bubblewrap、Windows 受限令牌 +
   显式拒绝 ACE。纯 Go、无 cgo（只依赖 `golang.org/x/sys` 与 `x/text`）。
 - **fail-closed**：本平台无法表达的规则在启动前就被拒绝；没有可用沙箱后端时报错且
@@ -71,7 +74,7 @@ code, err := mgr.RunProcess(ctx, vbox.StartOptions{
 
 ```go
 d := policy.FS.Match("/srv/work/out.txt", vbox.OpWrite)
-// d.Allow、d.Matched（命中行号，-1 = 走兜底）、d.Effect
+// d.Allow、d.Matched（命中行号，-1 = 走兜底）、d.Effect、d.Level
 
 allow := policy.Net.Match("api.example.com:443")
 ```
@@ -80,6 +83,9 @@ allow := policy.Net.Match("api.example.com:443")
 （作用于链接本身）。`MatchPath` 接收已归一化的路径，不碰宿主文件系统。
 
 ## 规则表
+
+行首每个 `!` 增加一级 level（0–255），随后是三种效果前缀；例如 `!!deny:/secret`
+是 level 2 的拒绝行。`Class` 不推导 level。
 
 三种效果前缀：
 
@@ -91,18 +97,19 @@ allow := policy.Net.Match("api.example.com:443")
 
 模式：裸路径覆盖整棵子树（`/srv/work` 覆盖 `/srv/work/a/b`）；`*` 匹配段内任意字符、
 `?` 匹配单字符、`**` 匹配零或多段（所以 `/etc/ssh/**` 连 `/etc/ssh` 自身也匹配）。
-表从头扫到尾，首命中生效。
+匹配先比较 level：高 level 优先；同 level 按原表顺序扫描，首命中生效。
 
 `Class`（`ClassTemp` / `ClassCfg` / `ClassBuiltin` / `ClassConvenience`）只用于调用方把
-不同来源的行拼成稳定顺序（temp grant → 配置 → 出厂内建 → 便利根）；判定本身不看 `Class`。
+不同来源的行拼成稳定顺序（temp grant → 配置 → 出厂内建 → 便利根）；判定本身不看
+`Class`，也不从 `Class` 推导 level。
 
 ### 两个容易踩的点
 
-**行序陷阱：被压住的行是安静的。** 如果靠前的 `rw:` 行已经覆盖了靠后的 `deny:` / `ro:`
-目标，后者永远轮不到求值，执行端会直接放行。装配期用 `IneffectiveRows(rules)` 拿到
-「被上方 `rw` 行完全覆盖」的行下标——判定保守（只报能静态证明的包含关系），编译本身
-不因死行失败。注入 `Manager.SetLogf` 时，执行路径也会打一条
-`shadowed by an earlier rw row` 日志。
+**优先级陷阱：被压住的行是安静的。** 如果更高优先级的 `rw:` 行已经覆盖了其他 `deny:` /
+`ro:` 目标，后者永远轮不到求值，执行端会直接放行。高 level 行优先，同 level 前行优先。
+装配期用 `IneffectiveRows(rules)` 拿到「被更高优先级 `rw` 行完全覆盖」的行下标——
+判定保守（只报能静态证明的包含关系），编译本身不因死行失败。注入 `Manager.SetLogf` 时，
+执行路径也会打一条 `shadowed by a higher-priority rw row` 日志。
 
 **规则表请用 `NewFSRuleSet` / `CompileFSRules` 构造，不要用结构体字面量。** 字面构造的
 `FSRuleSet` 必须自带 canonical 模式：`Match` 入口只归一化**路径**侧，模式用了别的拼写就会
@@ -124,9 +131,9 @@ allow := policy.Net.Match("api.example.com:443")
 
 | 平台 | 机制 | 说明 |
 | --- | --- | --- |
-| macOS | Seatbelt（SBPL profile） | 按 first-wins 快照**逆序**写出（SBPL 后规则胜 ⟺ 首命中胜）；`ro` 行同时显式下沉写拒，可写根内的只读洞在内核真实生效 |
-| Linux | bubblewrap | 整机只读视图 + 白名单写绑定；可实例化目标的 `ro`/`rw` 洞按行序回补；需要 bwrap 与 user namespace 可用 |
-| Windows | 受限令牌 + 显式拒绝 ACE | 句柄版 ACL（`\\?\` 长路径、`Get/SetSecurityInfo`）；终局 `rw` 目标跳过 ACE，`deny` 与独立 `ro` 行落拒绝 ACE；嵌套只读洞只在工具层生效 |
+| macOS | Seatbelt（SBPL profile） | 按 `level + 原表序` 的统一优先级**逆序**写出（SBPL 后规则胜）；`ro` 行同时显式下沉写拒，可写根内的只读洞在内核真实生效 |
+| Linux | bubblewrap | 整机只读视图 + 终局可写根绑定；可实例化目标的 `ro`/`rw` 洞按终局判定回补；需要 bwrap 与 user namespace 可用 |
+| Windows | 受限令牌 + 显式拒绝 ACE | 句柄版 ACL（`\\?\` 长路径、`Get/SetSecurityInfo`）；终局 `rw` 目标跳过 ACE，`deny` 与独立 `ro` 行落拒绝 ACE；有效嵌套只读洞无法完整落实时明确报不支持 |
 | 其他 | 无内核沙箱 | 明确报错，不静默裸跑 |
 
 ### 网络规则落地
@@ -135,24 +142,51 @@ net 域的落地能力与 fs 不同，按「姿态 + 逐条」分开说：
 
 | 平台 | 姿态（Default） | 逐条规则 |
 | --- | --- | --- |
-| macOS | 内核落实（deny = 全断） | **仅 loopback** 逐条落实（Seatbelt remote tcp）；其余 deny 行拒启 |
+| macOS | deny 由 Seatbelt 全断姿态 + 内建出站代理共同落实；open 保持原行为 | loopback 由 Seatbelt 逐条落实；deny 下非 loopback 规则由内建 HTTP/SOCKS5 代理按完整快照落实；open 下不可落实的选择性 deny 仍拒启 |
 | Linux | 内核落实（deny = `--unshare-net` 全断，新 netns 的 loopback 未配置，回环同样不可达） | 不可表达 |
 | Windows | 仅 open；deny 姿态整体拒启 | 不可表达 |
 
 不可内核落实的行按方向处理，**永不比策略更宽**：
 
 - **deny 行**：跳过它沙箱就比策略宽——启动前拒绝（fail-closed）。
-- **allow 行**：在 deny 姿态下被吸收（目标在该姿态的沙箱里本不可达，收窄与
-  fail-closed 同向），记日志不拒启；在 open 姿态下本就是 no-op（无 deny 行
-  时不收紧）。
-- **`tool:` 前缀**：`tool:deny:169.254.169.254:*` 声明该行仅由调用方的工具层
-  （进程内 HTTP/MCP 客户端等）执行，内核落地一概跳过、不参与「能否落实」判定
-  ——用于平台无法落实但工具层可执行的规则。判定入口（`Match`/`Resolve`）不看
-  ToolOnly，工具层照常命中。
+- **allow 行**：Linux deny 姿态下可被吸收（目标在该姿态的沙箱里本不可达，收窄与
+  fail-closed 同向）；darwin deny 姿态下非 loopback allow 改由代理真实执行，不再
+  被当成不可达行吸收。open 姿态下无法落地时，省略 allow 只会收窄。darwin 的
+  loopback 有效胜出行则由内核真实落地。
+- **没有执行层标记**：规则只描述子进程的 FS/NET 目标，不接受执行层前缀或字段。
+  当前后端无法完整落实有效规则时，明确返回「不支持」并拒绝启动；不过滤规则、
+  不改道，也不以其他执行层代替本库落地。
 
-启动前预检用 `CheckNetPolicy(platform, rules)`：逐条返回 landed / absorbed（含
-no-op 区分）分类，遇到「落实不了、跳过又会变宽」的行报错——调用方可在配置/
-授权那一刻就失败，而不是埋到 exec 期。
+net 规则模式支持严格子域通配 `*.example.com`（不匹配裸域或 IP）；`localhost`、
+`.localhost` 子名与回环 IP 归一为同一类，`*.localhost` 匹配该类。
+
+启动前预检用 `CheckNetPolicy(platform, rules)`：逐条返回 `Kernel` / `Proxy` /
+`Absorbed` / `Reserved` 分类。语法错误与 `UnsupportedError` 是两类错误；能力不支持
+只拒绝依赖该能力的进程启动，不改变规则语义。静态预检与 darwin Seatbelt 输出共用
+`compileNetPlan`。
+
+### darwin 内建出站代理
+
+仅在 `confined && darwin && NetRuleSet.Default == false` 时启动；open 与 `NoSandbox`
+不创建 endpoint、不注入代理环境。代理监听两个仅 loopback 的端口，分别提供 HTTP
+`CONNECT` / plain HTTP absolute-form 与 SOCKS5 `CONNECT`。每个 endpoint 使用独立随机
+认证 token；只转发 TCP，不终止 TLS、不支持 UDP。
+
+- 启动计划为两个 transport 端口生成最高优先级 Reserved loopback 放行；最终目标仍按
+  本次完整规则快照判定，loopback 直连继续由 Seatbelt 规则决定。
+- `HTTP_PROXY / HTTPS_PROXY / ALL_PROXY` 及小写形式由 vbox 最后强制设置，`ALL_PROXY`
+  使用 `socks5h://`；`NO_PROXY / no_proxy` 合并并包含 `127.0.0.1,localhost,::1`，
+  调用方 `Env` 不能覆盖内部 endpoint。
+- `NetRuleSet.UpstreamProxy` 可显式指定 `http://`、`socks5://` 或 `socks5h://` 上游；
+  该值进入 netKey，绝不隐式继承宿主 ambient proxy。
+- 域名先解析再按每个具体 IP 判定；内网、回环、link-local、metadata、本机接口等地址
+  不接受域名行放行，只能由匹配的 IP/loopback 行放行。下游连接只使用已授权 IP，避免
+  上游再次解析域名造成 DNS 重绑定。
+- endpoint 按完整 netKey 在 Manager 内单飞复用，进程结束 release；默认空闲宽限期
+  30s，活跃请求/隧道不被空闲驱逐，`Manager.Close` 关闭 listener、连接与 handler。
+
+代理 token 不是同 UID 恶意进程之间的隔离边界；能读取其他进程环境的同 UID 进程仍可能
+获得它。需要更强隔离时必须使用独立 OS 用户或独立 broker。
 
 Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件（默认
 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`，可用 `Manager.SetStateDir` 指定），
@@ -183,9 +217,8 @@ Windows 侧为拒绝 ACE 的幂等对账保留一份状态文件（默认
 
 ## 不在这里的东西
 
-配置解析、默认规则源、会话授权、grant 生命周期与审批都不在本库；vbox 只接收快照、
-做判定并落地。参考集成：[aic-pod](https://github.com/veypi/aic-pod) 的 `libs/host`
-作为外部使用者负责配置与授权，每次调用编译快照交给 vbox。
+配置解析、默认规则源、会话授权、grant 生命周期、审批、命令注册和调度都不在本库。
+vbox 只接收 FS/NET 快照、做判定并落实原生进程沙箱，不描述或依赖任何特定调用方。
 
 ## 测试
 
@@ -200,6 +233,7 @@ Windows 的 ACL 用例需要真实令牌与对象句柄。缺少能力时用例�
 
 ## 文档、版本与许可
 
+- 文档地图见 [docs/index.md](docs/index.md)。
 - 行为变更见 [CHANGELOG.md](CHANGELOG.md)；当前版本见 [VERSION](VERSION)。
 - 贡献者与 AI 代理须知（含不可破坏的契约）见 [AGENTS.md](AGENTS.md)。
 - MIT（[LICENSE](LICENSE)）。

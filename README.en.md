@@ -18,10 +18,15 @@ vbox does one thing: it takes a rule snapshot from *your* code and makes the ope
 system enforce it for one child process. Configuration parsing, approvals, grant lifetimes
 and audit all stay in the caller — vbox never reads your config and never decides policy.
 
+This document describes the current rule contract. Manager snapshot caching and the
+darwin deny-posture egress proxy are implemented; real-host acceptance and remaining
+work are tracked in [docs/development/todo.md](docs/development/todo.md).
+
 ## What you get
 
-- **One ordered rule table, first match wins.** Rule order *is* the policy; there are no
-  override layers, no "more specific rule wins" surprises. New rules go on top.
+- **One ordered rule table using `level + original order`.** Higher levels match first;
+  rows at the same level keep first-match-wins table order. There is no specificity rule or
+  implicit override layer, and `Class` never derives a level.
 - **Kernel enforcement, not emulation.** macOS Seatbelt (SBPL), Linux bubblewrap, Windows
   restricted token + explicit deny ACEs. Pure Go, no cgo (`golang.org/x/sys` + `x/text`).
 - **Fail-closed.** A rule this platform cannot express is rejected before anything starts;
@@ -74,7 +79,7 @@ Ask the table directly when you only want a decision:
 
 ```go
 d := policy.FS.Match("/srv/work/out.txt", vbox.OpWrite)
-// d.Allow, d.Matched (matched row index, -1 = fell through to the default), d.Effect
+// d.Allow, d.Matched (matched row index, -1 = fell through to the default), d.Effect, d.Level
 
 allow := policy.Net.Match("api.example.com:443")
 ```
@@ -84,6 +89,9 @@ allow := policy.Net.Match("api.example.com:443")
 already-normalized path and never touches the host filesystem.
 
 ## Rule table
+
+Each leading `!` adds one level (0–255), before the effect prefix; for example,
+`!!deny:/secret` is a level-2 deny row. `Class` never derives a level.
 
 Effects, in the order they usually appear in a table:
 
@@ -95,21 +103,23 @@ Effects, in the order they usually appear in a table:
 
 Patterns: a bare path covers its whole subtree (`/srv/work` covers `/srv/work/a/b`);
 `*` matches within one segment, `?` one character, `**` matches zero or more segments
-(so `/etc/ssh/**` also matches `/etc/ssh` itself). Rows are scanned front to back and the
-first match decides.
+(so `/etc/ssh/**` also matches `/etc/ssh` itself). Matching compares level first; rows at
+the same level are scanned front to back and the first match decides.
 
 `Class` (`ClassTemp` / `ClassCfg` / `ClassBuiltin` / `ClassConvenience`) only exists so a
 caller can concatenate rows from different sources in a stable order (temp grants → config →
-built-in defaults → convenience roots). Matching ignores `Class`.
+built-in defaults → convenience roots). Matching ignores `Class` and never derives a level
+from it.
 
 ### Two rules that bite
 
-**Order matters, and a shadowed row is silent.** If an earlier `rw:` row already covers a
-later `deny:` / `ro:` target, that later row can never match — the execution side simply
-allows it. Call `IneffectiveRows(rules)` at assembly time to get the indexes of rows that
-an earlier `rw` row fully covers (the check is conservative: it only reports cases it can
-prove statically, and it never fails compilation). With `Manager.SetLogf` set, the
-execution path also logs a `shadowed by an earlier rw row` line.
+**Priority matters, and a shadowed row is silent.** If a higher-priority `rw:` row already
+covers a `deny:` / `ro:` target, that covered row can never match — the execution side simply
+allows it. Higher levels win first; earlier rows win within one level. Call
+`IneffectiveRows(rules)` at assembly time to get the indexes of rows that a higher-priority
+`rw` row fully covers (the check is conservative: it only reports cases it can prove statically,
+and it never fails compilation). With `Manager.SetLogf` set, the execution path also logs a
+`shadowed by a higher-priority rw row` line.
 
 **Build tables with `NewFSRuleSet` / `CompileFSRules`, not with struct literals.** A
 hand-built `FSRuleSet` must carry canonical patterns: `Match` normalizes the *path* side on
@@ -132,9 +142,9 @@ Anything not listed counts as "not promised". How each backend maps the same tab
 
 | Platform | Mechanism | Notes |
 | --- | --- | --- |
-| macOS | Seatbelt (SBPL profile) | Profile is emitted in reverse first-wins order (SBPL lets later rules win); `ro` rows also sink an explicit write denial, so read-only holes inside writable roots are enforced by the kernel |
-| Linux | bubblewrap | Whole-machine read-only view plus write bindings for granted roots; `ro`/`rw` holes are re-added in table order; requires `bwrap` and user namespaces |
-| Windows | Restricted token + deny ACEs | Handle-based ACL (`\\?\` long paths, `Get/SetSecurityInfo`); targets that resolve to `rw` get no ACE, `deny` and standalone `ro` rows get a deny ACE; nested read-only holes exist only at the tool layer |
+| macOS | Seatbelt (SBPL profile) | Profile is emitted in reverse `level + original-order` priority (SBPL lets later rules win); `ro` rows also sink an explicit write denial, so read-only holes inside writable roots are enforced by the kernel |
+| Linux | bubblewrap | Whole-machine read-only view plus bindings for terminal writable roots; `ro`/`rw` holes are re-added from terminal decisions; requires `bwrap` and user namespaces |
+| Windows | Restricted token + deny ACEs | Handle-based ACL (`\\?\` long paths, `Get/SetSecurityInfo`); targets that resolve to `rw` get no ACE, `deny` and standalone `ro` rows get a deny ACE; an effective nested read-only hole that cannot be enforced reports unsupported before launch |
 | Other | No kernel sandbox | Explicit error, never a silent unsandboxed run |
 
 ### Network rule enforcement
@@ -144,7 +154,7 @@ separate:
 
 | Platform | Posture (`Default`) | Per-row rules |
 | --- | --- | --- |
-| macOS | Kernel-enforced (deny = full block) | **Loopback only** (Seatbelt remote tcp); any other deny row aborts the launch |
+| macOS | deny combines the Seatbelt full-block posture with the built-in egress proxy; open keeps its previous behavior | Loopback rows use Seatbelt; under deny, non-loopback rows use the HTTP/SOCKS5 proxy with the complete snapshot. Under open, an unenforceable selective deny still aborts launch |
 | Linux | Kernel-enforced (deny = `--unshare-net`; the new netns leaves loopback unconfigured, so even loopback is unreachable) | Not expressible |
 | Windows | open only; the deny posture aborts the launch outright | Not expressible |
 
@@ -153,19 +163,50 @@ wider than the policy**:
 
 - **deny rows**: dropping one would widen the sandbox, so the launch is refused
   (fail-closed).
-- **allow rows**: under the deny posture they are *absorbed* — the target is already
-  unreachable in that sandbox, so skipping the row is strictly narrower and is logged,
-  not refused. Under the open posture they are no-ops (nothing is tightened without
-  deny rows).
-- **`tool:` prefix**: `tool:deny:169.254.169.254:*` declares a row enforced only by
-  the caller's tool layer (an in-process HTTP/MCP client, etc.); kernel enforcement
-  and the enforceability check skip it entirely. `Match`/`Resolve` ignore `ToolOnly`,
-  so the tool layer still honors the row.
+- **allow rows**: under Linux deny they may be *absorbed* because the target is already
+  unreachable. Under darwin deny, non-loopback allows are enforced by the proxy instead
+  of being absorbed. Under open, omitting an allow that cannot land only narrows the
+  result. On darwin, winning loopback rows are enforced by the kernel.
+- **No execution-layer markers**: rules describe only the child process FS/NET targets;
+  execution-layer prefixes and fields are rejected. If the active backend cannot enforce
+  an effective rule, it reports "unsupported" and refuses to launch; it never drops the
+  rule, reroutes execution, or substitutes another execution layer.
 
-Use `CheckNetPolicy(platform, rules)` to pre-flight a table: it classifies every row
-as landed / absorbed (with a `Noop` flag separating "unchanged semantics" from
-"narrower than configured") and errors on the first row that can neither land nor be
-absorbed — so callers can fail at config/grant time instead of at exec time.
+Rule patterns support strict subdomain wildcards such as `*.example.com` (not the bare
+domain or IP literals). `localhost`, `.localhost` subnames and loopback IPs form one
+canonical class; `*.localhost` matches that class.
+
+Use `CheckNetPolicy(platform, rules)` to pre-flight a table: it classifies every row as
+`Kernel` / `Proxy` / `Absorbed` / `Reserved`. Syntax errors and `UnsupportedError` are
+distinct; an unsupported capability rejects only the dependent process launch and never
+rewrites policy semantics. Static preflight and darwin Seatbelt emission share `compileNetPlan`.
+
+### Built-in darwin egress proxy
+
+The endpoint starts only for `confined && darwin && NetRuleSet.Default == false`. Open and
+`NoSandbox` neither create an endpoint nor inject proxy variables. Two loopback-only
+listeners provide HTTP `CONNECT` / plain HTTP absolute-form and SOCKS5 `CONNECT`. Each
+endpoint has an independent random authentication token. Only TCP is forwarded; TLS is
+not terminated and UDP is unsupported.
+
+- The launch plan emits highest-priority Reserved loopback transport rules for both
+  listener ports. Final targets still use the complete immutable policy snapshot, while
+  direct loopback access remains governed by Seatbelt.
+- Upper- and lowercase `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are forced last;
+  `ALL_PROXY` uses `socks5h://`. `NO_PROXY` / `no_proxy` are merged and include
+  `127.0.0.1,localhost,::1`; caller `Env` cannot replace the internal endpoint.
+- `NetRuleSet.UpstreamProxy` explicitly selects an `http://`, `socks5://` or `socks5h://`
+  upstream. It is part of netKey; ambient host proxy variables are never inherited.
+- Domains are resolved before each concrete IP is authorized. Private, loopback,
+  link-local, metadata and local-interface addresses cannot be allowed by a domain row;
+  they need a matching IP/loopback row. Downstream connections use only the authorized
+  IP, so an upstream proxy cannot re-resolve the domain into a different address.
+- Endpoints are built once per netKey and reused within a Manager. Process completion
+  releases the lease; the default idle grace period is 30s, active requests/tunnels are
+  not idle-evicted, and `Manager.Close` closes listeners, connections and handlers.
+
+The token is not an isolation boundary against a malicious same-UID process that can read
+another process environment. Stronger isolation requires a separate OS user or broker.
 
 On Windows, idempotent deny-ACE bookkeeping is kept in a state file (default
 `{UserConfigDir}/vbox/sandbox/deny_acl_state.json`; override with `Manager.SetStateDir`),
@@ -205,10 +246,10 @@ wider than the policy.
 
 ## What is not here
 
-Config parsing, default rule sources, session grants, grant lifetimes and approval flows
-are all the caller's job. vbox receives a snapshot, decides, and enforces. A reference
-integration is [aic-pod](https://github.com/veypi/aic-pod) (`libs/host`), which owns
-configuration and authorization and compiles a snapshot per call.
+Config parsing, default rule sources, session grants, grant lifetimes, approvals,
+command registration and scheduling are all outside this library. vbox receives an
+FS/NET snapshot, decides, and enforces it for a native child process. It neither
+describes nor depends on any particular caller or integration layer.
 
 ## Testing
 
@@ -224,6 +265,7 @@ cross-`GOOS` compile proves nothing about runtime behavior.
 
 ## Docs, version, license
 
+- Documentation map: [docs/index.md](docs/index.md).
 - Behavior changes: [CHANGELOG.md](CHANGELOG.md); current version: [VERSION](VERSION).
 - Contributor and AI-agent notes, including the invariants that must not be broken:
   [AGENTS.md](AGENTS.md).

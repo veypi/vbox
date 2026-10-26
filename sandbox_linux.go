@@ -43,7 +43,7 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if err := validateProcessPolicy(spec, "linux"); err != nil {
 		return launchPlan{}, err
 	}
-	denyTargets, _, err := denyCoverAllCached(spec.denyPatterns(), spec.logf)
+	denyTargets, _, err := denyCoverAllCached(spec.resources, spec.denyPatterns(), spec.logf)
 	if err != nil {
 		return launchPlan{}, err
 	}

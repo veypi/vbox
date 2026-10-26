@@ -46,5 +46,24 @@ func planConfined(spec confineSpec) (launchPlan, error) {
 	if selectBackend() == backendUnavailable {
 		return launchPlan{}, sandboxUnavailable()
 	}
-	return launchPlan{argv: confineRlimits(seatbeltArgs(spec))}, nil
+	var lease *egressLease
+	var err error
+	if !spec.netRules.Default {
+		lease, err = acquireEgressEndpoint(spec.resources, spec.netRules)
+		if err != nil {
+			return launchPlan{}, err
+		}
+		spec.egress = lease
+	}
+	argv, err := seatbeltArgs(spec)
+	if err != nil {
+		lease.release()
+		return launchPlan{}, err
+	}
+	plan := launchPlan{argv: confineRlimits(argv)}
+	if lease != nil {
+		plan.forcedEnv = lease.endpoint.proxyEnv()
+		plan.cleanup = lease.release
+	}
+	return plan, nil
 }

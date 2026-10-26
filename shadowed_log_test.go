@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-// TestShadowedRowsLogged：执行路径（Manager.RunProcess + SetLogf）对「被上方
-// rw 行完全覆盖、永不生效」的 deny/ro 行打日志——死行在执行端是安静的
+// TestShadowedRowsLogged：执行路径（Manager.RunProcess + SetLogf）对「被更高
+// 优先级 rw 行完全覆盖、永不生效」的 deny/ro 行打日志——死行在执行端是安静的
 // （Windows 只有一句 deny ACE skip rw-hole），这条日志是使用者唯一的线索。
 // 只断言日志，不断言子进程结果：后端可用性不是本用例的验证目标。
 func TestShadowedRowsLogged(t *testing.T) {
@@ -34,7 +34,7 @@ func TestShadowedRowsLogged(t *testing.T) {
 	}, nil, io.Discard, io.Discard)
 
 	for _, l := range logs {
-		if strings.Contains(l, "shadowed by an earlier rw row") {
+		if strings.Contains(l, "shadowed by a higher-priority rw row") {
 			return
 		}
 	}

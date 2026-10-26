@@ -25,10 +25,11 @@ type Manager struct {
 	logf      atomic.Value // func(string, ...any)
 	closed    bool
 	running   map[*procHandle]struct{}
+	cache     *resourceCache
 }
 
 func NewManager() *Manager {
-	return &Manager{running: map[*procHandle]struct{}{}}
+	return &Manager{running: map[*procHandle]struct{}{}, cache: newResourceCache()}
 }
 
 // stateDirOverride 是调用方显式指定的沙箱持久状态目录（空 = 平台默认目录）。
@@ -90,12 +91,17 @@ func (m *Manager) Close(ctx context.Context) error {
 			killProc(h)
 		}
 	}
+	var runErr error
 	for _, h := range handles {
 		select {
 		case <-h.done:
 		case <-ctx.Done():
-			return ctx.Err()
+			runErr = ctx.Err()
 		}
 	}
-	return nil
+	cacheErr := m.cache.Close()
+	if runErr != nil {
+		return runErr
+	}
+	return cacheErr
 }

@@ -2,6 +2,27 @@
 
 版本号见 [VERSION](VERSION)，遵循 SemVer：破坏性变更进位 minor。
 
+## 0.3.4 — 2026-10-27
+
+### 文档
+
+- 统一文档架构：`docs/TODO.md` 移至 `docs/development/todo.md`，新增
+  [docs/index.md](docs/index.md) 文档地图；README / README.en / AGENTS 同步链接与文档约定。
+
+### 新增与破坏性契约调整
+
+- FS/Net 规则统一使用 `level + 原表序`，移除执行层 `tool:` / `ToolOnly` 标记；
+  `CheckNetPolicy` 通过 `Kernel / Proxy / Absorbed / Reserved` 报告真实落地，
+  语法错误与 `UnsupportedError` 分开。
+- Manager 新增按完整 FS/Net 快照键派生的资源缓存：同 key 单飞、引用释放、空闲与
+  容量驱逐、死亡重建和统一 `Close`；缓存不保存或推断当前权限。
+- darwin deny 姿态新增内建 HTTP CONNECT / plain HTTP absolute-form / SOCKS5
+  出站代理。非 loopback 选择性 allow 由完整不可变快照落实，loopback 直连仍由
+  Seatbelt 控制；open 与 NoSandbox 不创建代理。
+- 新增 `NetRuleSet.UpstreamProxy` 显式上游、随机 endpoint 认证、强制代理 env、
+  DNS/IP 地址防护、连接与隧道上限、30s 空闲宽限期和 `Manager.Close` 中断回收。
+  不继承宿主 ambient proxy，不支持 UDP 或 TLS 终止。
+
 ## 0.3.3 — 2026-10-16
 
 ### 修复

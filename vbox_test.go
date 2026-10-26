@@ -247,13 +247,13 @@ func TestParseFSRuleGuards(t *testing.T) {
 		"rw:C:/", "rw:C:", "rw:c:/**",
 	}
 	for _, raw := range bad {
-		if _, _, err := ParseFSRule(raw); err == nil {
+		if _, _, _, err := ParseFSRule(raw); err == nil {
 			t.Fatalf("ParseFSRule(%q) 应报错", raw)
 		}
 	}
 	good := []string{"deny:~/.ssh", "ro:/usr", "rw:/proj/x", "rw:~/work/**", "deny:C:/Windows/**"}
 	for _, raw := range good {
-		if _, _, err := ParseFSRule(raw); err != nil {
+		if _, _, _, err := ParseFSRule(raw); err != nil {
 			t.Fatalf("ParseFSRule(%q) err = %v", raw, err)
 		}
 	}

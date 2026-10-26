@@ -31,7 +31,7 @@ func TestProcessEnvironment(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command(binary, "-test.run=^TestProcessEnvironment$")
-			cmd.Env = processEnv(cmd.Environ(), []string{"VBOX_ENV_PROBE=1", "VBOX_TEST_VALUE=platform", "SKILLPROC_SOCKET=socket"}, tc.explicit, tc.confined)
+			cmd.Env = processEnv(cmd.Environ(), []string{"VBOX_ENV_PROBE=1", "VBOX_TEST_VALUE=platform", "SKILLPROC_SOCKET=socket"}, tc.explicit, tc.confined, nil)
 			out, err := cmd.CombinedOutput()
 			if err != nil || string(out) != tc.want {
 				t.Fatalf("environment=%q, err=%v; want %q", out, err, tc.want)

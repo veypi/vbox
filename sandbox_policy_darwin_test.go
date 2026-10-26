@@ -14,8 +14,8 @@ import (
 // legacy last-wins 表切换为 vbox first-wins 快照）。
 
 // seatbeltProfile 渲染 seatbeltArgs 的 profile 段（去掉可执行文件前缀与 argv）。
-func seatbeltProfile(spec confineSpec) string {
-	argv := seatbeltArgs(spec)
+func seatbeltProfile(t *testing.T, spec confineSpec) string {
+	argv := mustSeatbeltArgs(t, spec)
 	// [sandbox-exec, -p, profile, --, argv...]
 	if len(argv) < 4 {
 		return ""
@@ -31,7 +31,7 @@ func TestSeatbeltFSRulesReversedEmission(t *testing.T) {
 		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
 		{Pattern: "/Users/v/work", Effect: EffRW, Class: ClassConvenience},
 	}, DefaultWrite: EffDeny}
-	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo", "hi"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
+	profile := seatbeltProfile(t, confineSpec{argv: []string{"/bin/echo", "hi"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	idx := func(sub string) int { return strings.Index(profile, sub) }
 	// 逆序：便利根（表尾）最先输出，temp（表头）最后输出。
 	iConv := idx(`(allow file-write* (subpath "/Users/v/work"))`)
@@ -54,7 +54,7 @@ func TestSeatbeltFSRulesHoleSemantics(t *testing.T) {
 		{Pattern: "/Users/v/.ssh/known_hosts", Effect: EffRO, Class: ClassCfg},
 		{Pattern: "/Users/v/.ssh/**", Effect: EffDeny, Class: ClassCfg},
 	}, DefaultWrite: EffDeny}
-	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
+	profile := seatbeltProfile(t, confineSpec{argv: []string{"/bin/echo"}, fsRules: snap, netRules: NetRuleSet{Default: true}})
 	iRo := strings.Index(profile, `(allow file-read* (subpath "/Users/v/.ssh/known_hosts"))`)
 	iDeny := strings.Index(profile, `(deny file-read* (regex "^/Users/v/\\.ssh(/.*)?$"))`)
 	if iRo < 0 || iDeny < 0 {
@@ -77,7 +77,7 @@ func TestSeatbeltOpenWithDeny(t *testing.T) {
 	snapOpen := FSRuleSet{Rules: []Rule{
 		{Pattern: "**/.ssh/**", Effect: EffDeny, Class: ClassBuiltin},
 	}, DefaultWrite: EffRW}
-	profile := seatbeltProfile(confineSpec{argv: []string{"/bin/echo"}, fsRules: snapOpen, netRules: NetRuleSet{Default: true}})
+	profile := seatbeltProfile(t, confineSpec{argv: []string{"/bin/echo"}, fsRules: snapOpen, netRules: NetRuleSet{Default: true}})
 	if !strings.Contains(profile, "(allow file-write*)") {
 		t.Fatalf("fsOpen 缺打底放行：\n%s", profile)
 	}

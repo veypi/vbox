@@ -12,8 +12,8 @@ func TestParseEntry(t *testing.T) {
 		{"Example.COM:443", "example.com", "443"},
 		{"user@host.cn:22", "host.cn", "22"},
 		{"8.8.8.8:53", "8.8.8.8", "53"},
-		{"[::1]:8080", "::1", "8080"},
-		{"::1", "::1", "*"},
+		{"[::1]:8080", "localhost", "8080"},
+		{"::1", "localhost", "*"},
 		{"example.com.:443", "example.com", "443"},
 		{"host:0443", "host", "443"},
 	}
@@ -76,6 +76,13 @@ func TestNetRuleSetDefaultDeny(t *testing.T) {
 	// 非法目标 fail-closed。
 	if set.Match("bad host:80") {
 		t.Fatalf("invalid target = true, want false")
+	}
+}
+
+func TestParseNetRuleRejectsExecutionLayerPrefix(t *testing.T) {
+	t.Parallel()
+	if _, err := ParseNetRule("tool:deny:example.com:443"); err == nil {
+		t.Fatal("legacy execution-layer prefix must be a syntax error")
 	}
 }
 

@@ -6,13 +6,58 @@ import (
 )
 
 // processEnv 是两个进程入口共用的环境装配：先清洗继承环境，再应用
-// 平台环境和调用方显式覆盖。显式传入的凭据不属于隐式继承的秘密。
-// os/exec 负责同名键去重（后值优先，也处理 Windows 的大小写）。
-func processEnv(env, platform, explicit []string, confined bool) []string {
+// 平台环境、调用方显式覆盖，最后应用沙箱强制变量。显式传入的凭据不属于
+// 隐式继承的秘密；forced 是安全边界，调用方不能覆盖。os/exec 负责同名键
+// 去重（后值优先，也处理 Windows 的大小写）。
+func processEnv(env, platform, explicit []string, confined bool, forced []string) []string {
 	if confined {
 		env = ScrubEnv(env)
 	}
-	return append(append(env, platform...), explicit...)
+	env = append(append(env, platform...), explicit...)
+	if len(forced) == 0 {
+		return env
+	}
+	noProxy := proxyNoProxy(env)
+	env = removeProxyEnv(env)
+	env = append(env, forced...)
+	return append(env, "NO_PROXY="+noProxy, "no_proxy="+noProxy)
+}
+
+var proxyEnvNames = map[string]bool{
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true,
+	"NO_PROXY": true,
+}
+
+func removeProxyEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		name, _, _ := strings.Cut(item, "=")
+		if proxyEnvNames[strings.ToUpper(name)] {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func proxyNoProxy(env []string) string {
+	seen := map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true}
+	values := []string{"127.0.0.1", "localhost", "::1"}
+	for _, item := range env {
+		name, value, ok := strings.Cut(item, "=")
+		if !ok || strings.ToUpper(name) != "NO_PROXY" {
+			continue
+		}
+		for _, entry := range strings.Split(value, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" || seen[entry] {
+				continue
+			}
+			seen[entry] = true
+			values = append(values, entry)
+		}
+	}
+	return strings.Join(values, ",")
 }
 
 // 沙箱 env 清洗：

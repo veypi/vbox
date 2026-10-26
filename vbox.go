@@ -3,10 +3,10 @@
 //
 // 它只做三件事：
 //
-//   - 规则模型：FS 与 Net 各一张有序表，从前向后扫描、首命中生效（first-wins）。
-//     行首是效果前缀：文件域 ro:/rw:/deny:，网络域 allow:/deny:（host:port）。
-//     行为完全由行序决定，没有「谁压谁」的特殊规则；Class 只用于调用方拼接行序，
-//     判定时不看。
+//   - 规则模型：FS 与 Net 各一张有序表，按 level + 原表序求值：高 level 优先，
+//     同 level 首命中生效。行首可用 ! 增加 level，随后是效果前缀：文件域
+//     ro:/rw:/deny:，网络域 allow:/deny:（host:port）。Class 只用于调用方拼接，
+//     不推导 level，也不参与判定。
 //   - 判定：纯函数匹配（MatchPath / Match / MatchNoFollow / NetRuleSet.Resolve），
 //     不访问宿主文件系统，也不读配置。
 //   - 落地：把编译好的快照交给内核机制执行；当前平台无法表达的规则在启动前拒绝
@@ -83,6 +83,7 @@ type Rule struct {
 	Pattern string
 	Effect  Effect
 	Class   Class
+	Level   uint8 // 高 level 优先；同 level 保持原表序，Class 不推导 Level
 	// Resolve 可选：行命中时由回调按本次「路径 + 操作」现算效果，把「随目标
 	// 数量增长的一次性枚举行」换成「一行 + 按需判定」（如云 /skills/{id} 的
 	// 可见性：只查当前这一个 id，不枚举全库）。Handled=false = 回调不表态，
@@ -121,15 +122,19 @@ type Decision struct {
 	Allow   bool   // 本操作是否放行
 	Matched int    // 命中行序号（0 起）；-1 = 未命中（兜底生效）
 	Effect  Effect // 生效效果（命中行效果或兜底）
-	// Reason 动态行（Rule.Resolve）给出的说明（拒绝原因等）；静态命中行与
-	// 兜底判定的 Reason 为空，调用方自建文案。
+	Level   uint8  // 命中行 level；兜底为 0
+	// Reason 动态行（Rule.Resolve）或快照错误给出的说明（拒绝原因等）；
+	// 普通静态命中行与兜底判定的 Reason 为空，调用方自建文案。
 	Reason string
 }
 
-// FSRuleSet 文件规则集：有序表，从头扫、首命中生效。
+// FSRuleSet 文件规则集：高 level 优先，同 level 按原表序首命中。
 type FSRuleSet struct {
-	Rules        []Rule // 有序：从头扫、首命中生效；新规则插表头（同类插同类段头）
+	Rules        []Rule // 原表序在同 level 内保留；Class 不改变优先级
 	DefaultWrite Effect // 未命中写兜底（EffDeny | EffRW = fs_policy）；读默认开放
+	// Err 是快照来源的配置错误。非 nil 时读写都 fail-closed，且原生进程
+	// 必须在任何 OS 规则落地前拒绝启动；不能用空规则代替这个状态。
+	Err error
 }
 
 // NewFSRuleSet 构造规则集并对每行模式做 CanonicalPattern 归一（符号链接前缀
@@ -162,10 +167,22 @@ func (s FSRuleSet) MatchNoFollow(path string, op FileOp) Decision {
 
 // MatchPath evaluates an already normalized path without consulting the host filesystem.
 func (s FSRuleSet) MatchPath(cpath string, op FileOp) Decision {
+	if s.Err != nil {
+		return Decision{Allow: false, Matched: -1, Effect: EffDeny, Reason: s.Err.Error()}
+	}
+	best := -1
+	var bestLevel uint8
 	for i, r := range s.Rules {
+		if best >= 0 && r.Level <= bestLevel {
+			continue
+		}
 		if !MatchPattern(r.Pattern, cpath) {
 			continue
 		}
+		best, bestLevel = i, r.Level
+	}
+	if best >= 0 {
+		r := s.Rules[best]
 		eff := r.Effect
 		reason := ""
 		if r.Resolve != nil {
@@ -173,7 +190,7 @@ func (s FSRuleSet) MatchPath(cpath string, op FileOp) Decision {
 				eff, reason = res.Effect, res.Reason
 			}
 		}
-		return Decision{Allow: effectAllows(eff, op), Matched: i, Effect: eff, Reason: reason}
+		return Decision{Allow: effectAllows(eff, op), Matched: best, Effect: eff, Level: r.Level, Reason: reason}
 	}
 	// 未命中：读默认开放；写走 DefaultWrite 兜底（EffDeny|EffRW）。
 	if op == OpRead {

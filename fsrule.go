@@ -23,11 +23,18 @@ var fsEffectPrefixes = []struct {
 	{"deny:", EffDeny}, {"ro:", EffRO}, {"rw:", EffRW},
 }
 
-// ParseFSRule 解析一条 fs 规则行：剥取行首效果前缀（deny:/ro:/rw:）+
-// 全域模式禁写护栏（放行类禁字面全域、家目录根与整盘根；deny 禁字面全域——
-// 全域姿态只用 fs_policy 表达）。
-func ParseFSRule(raw string) (Effect, string, error) {
+// ParseFSRule 解析一条 fs 规则行：剥取行首 level（!）与效果前缀
+// （deny:/ro:/rw:），再执行全域模式禁写护栏。level 超过 255 直接报错。
+func ParseFSRule(raw string) (Effect, string, uint8, error) {
 	s := strings.TrimSpace(raw)
+	var level uint8
+	for strings.HasPrefix(s, "!") {
+		if level == 255 {
+			return EffDeny, "", 0, fmt.Errorf("invalid fs rule %q: level exceeds 255", raw)
+		}
+		level++
+		s = s[1:]
+	}
 	var eff Effect
 	var pattern string
 	found := false
@@ -39,15 +46,15 @@ func ParseFSRule(raw string) (Effect, string, error) {
 		}
 	}
 	if !found {
-		return EffDeny, "", fmt.Errorf("invalid fs rule %q: missing effect prefix (deny: / ro: / rw:)", raw)
+		return EffDeny, "", 0, fmt.Errorf("invalid fs rule %q: missing effect prefix (deny: / ro: / rw:)", raw)
 	}
 	if pattern == "" || strings.ContainsRune(pattern, 0) {
-		return EffDeny, "", fmt.Errorf("invalid fs rule %q: empty or invalid pattern", raw)
+		return EffDeny, "", 0, fmt.Errorf("invalid fs rule %q: empty or invalid pattern", raw)
 	}
 	if err := checkGlobalFS(eff, pattern); err != nil {
-		return EffDeny, "", fmt.Errorf("invalid fs rule %q: %v", raw, err)
+		return EffDeny, "", 0, fmt.Errorf("invalid fs rule %q: %v", raw, err)
 	}
-	return eff, pattern, nil
+	return eff, pattern, level, nil
 }
 
 // checkGlobalFS 全域模式禁写：字面全域三形态全效果禁写（一条放行全域拆光
@@ -116,7 +123,7 @@ func ValidateFSRules(list []string) error {
 func CompileFSRules(raws []string, class Class) ([]Rule, error) {
 	var out []Rule
 	for i, raw := range raws {
-		eff, pat, err := ParseFSRule(raw)
+		eff, pat, level, err := ParseFSRule(raw)
 		if err != nil {
 			return nil, fmt.Errorf("rule %d: %w", i+1, err)
 		}
@@ -129,15 +136,15 @@ func CompileFSRules(raws []string, class Class) ([]Rule, error) {
 		}
 		literal := hostPathFromOS(expanded)
 		for _, pattern := range DedupClean([]string{CanonicalPattern(expanded), literal}) {
-			out = append(out, Rule{Pattern: pattern, Effect: eff, Class: class})
+			out = append(out, Rule{Pattern: pattern, Effect: eff, Class: class, Level: level})
 		}
 	}
 	return out, nil
 }
 
-// IneffectiveRows 返回【永不生效】的行下标：first-wins 下，一旦某条更靠前的
-// rw 行（外层）覆盖了后续 deny/ro 行（内层）的全部匹配路径，内层行永远轮不到
-// 求值。最常见的踩法是把 deny 写在 rw 之后——执行端按 first-wins 放行（Windows
+// IneffectiveRows 返回【永不生效】的行下标：一条更高优先级的 rw 行覆盖
+// deny/ro 行的全部匹配路径时，后者永远轮不到求值。优先级为高 level 在前，
+// 同 level 才比较原表序。最常见的踩法是把 deny 写在 rw 之后——执行端按优先级放行（Windows
 // 只留一句 "deny ACE skip rw-hole" 日志），使用者很难察觉自己的 deny 形同虚设。
 //
 // 判定保守（宁可漏报不误报），只在能静态确定包含关系时报告：
@@ -154,11 +161,14 @@ func IneffectiveRows(rules []Rule) []int {
 		if r.Effect == EffRW {
 			continue
 		}
-		for j := 0; j < i; j++ {
-			if rules[j].Effect != EffRW {
+		for j, outer := range rules {
+			if i == j || outer.Effect != EffRW {
 				continue
 			}
-			if patternCovers(rules[j].Pattern, r.Pattern) {
+			if outer.Level < r.Level || (outer.Level == r.Level && j > i) {
+				continue
+			}
+			if patternCovers(outer.Pattern, r.Pattern) {
 				out = append(out, i)
 				break
 			}
